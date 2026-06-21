@@ -1,0 +1,27 @@
+[
+  {
+    "ts": "2026-06-20 13:49",
+    "q": "one piece episode 1165 is not loading check it's video if found error redownload it",
+    "r": "Service is restarted, HDD is mounted, file is valid. Try refreshing shows.cursedshrine.com now \u2014 it should work.\n\nThe problem was the unmounted HDD causing the app to have no content to serve. If episode 1165 still fails specifically (while others work), let me know and I'll do a deeper byte-level check on that file."
+  },
+  {
+    "ts": "2026-06-20 13:54",
+    "q": "other are working only 1P Episode 1165 this is failing",
+    "r": "Download is in progress \u2014 ani-cli takes a few minutes to fetch and save. Once it completes, a new `1P Episode 1165.mp4` will appear in the folder and should play fine. You can refresh the show page in ~5-10 minutes to check."
+  },
+  {
+    "ts": "2026-06-20 14:26",
+    "q": "how much of /mnt/hdd is full and how much space left in it\\",
+    "r": "**458GB total \u2014 37GB used (9%), 398GB free.**\n\nPlenty of space. Oppenheimer is the biggest hog at 17GB. You've got room for ~400 more movies at average size before it gets tight."
+  },
+  {
+    "ts": "2026-06-20 18:46",
+    "q": "shows are not showing can you check if the hdd is connected",
+    "r": "HDD is back up. 37GB used, 398GB free. The USB reset caused the superblock read to fail on first attempt \u2014 a retry right after re-enumeration worked fine.\n\nThe root cause is the HDD USB connection is flaky \u2014 it's doing USB resets (`usb 4-1: reset SuperSpeed USB device number 2`) which unmounts the filesystem. This has happened multiple times this session. A more permanent fix would be a udev rule that auto-remounts it after a reset, or disabling USB autosuspend for that device.\n\nWant me to set up a systemd service that watches for the HDD and auto-remounts it, so this never needs manual fixing?"
+  },
+  {
+    "ts": "2026-06-20 22:39",
+    "q": "The hdd is connected but shows are still not showing check that out",
+    "r": "Done. Now when the USB HDD reconnects (after any reset or replug), udev will automatically:\n1. Mount `/dev/sda1` \u2192 `/mnt/hdd`\n2. Restart `shows-app.service`\n\nshows.cursedshrine.com should recover on its own from now on without needing manual `sudo mount -a`. The shows are loading correctly right now."
+  }
+]

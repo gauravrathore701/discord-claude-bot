@@ -4,3 +4,9 @@ venv/
 __pycache__/
 *.pyc
 *.log
+.env.local
+*.env
+config.py
+secrets.*
+*.key
+*.pem
