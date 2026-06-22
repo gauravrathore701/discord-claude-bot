@@ -1,27 +1,27 @@
 [
   {
-    "ts": "2026-06-20 13:49",
-    "q": "one piece episode 1165 is not loading check it's video if found error redownload it",
-    "r": "Service is restarted, HDD is mounted, file is valid. Try refreshing shows.cursedshrine.com now \u2014 it should work.\n\nThe problem was the unmounted HDD causing the app to have no content to serve. If episode 1165 still fails specifically (while others work), let me know and I'll do a deeper byte-level check on that file."
-  },
-  {
-    "ts": "2026-06-20 13:54",
-    "q": "other are working only 1P Episode 1165 this is failing",
-    "r": "Download is in progress \u2014 ani-cli takes a few minutes to fetch and save. Once it completes, a new `1P Episode 1165.mp4` will appear in the folder and should play fine. You can refresh the show page in ~5-10 minutes to check."
-  },
-  {
-    "ts": "2026-06-20 14:26",
-    "q": "how much of /mnt/hdd is full and how much space left in it\\",
-    "r": "**458GB total \u2014 37GB used (9%), 398GB free.**\n\nPlenty of space. Oppenheimer is the biggest hog at 17GB. You've got room for ~400 more movies at average size before it gets tight."
-  },
-  {
-    "ts": "2026-06-20 18:46",
-    "q": "shows are not showing can you check if the hdd is connected",
-    "r": "HDD is back up. 37GB used, 398GB free. The USB reset caused the superblock read to fail on first attempt \u2014 a retry right after re-enumeration worked fine.\n\nThe root cause is the HDD USB connection is flaky \u2014 it's doing USB resets (`usb 4-1: reset SuperSpeed USB device number 2`) which unmounts the filesystem. This has happened multiple times this session. A more permanent fix would be a udev rule that auto-remounts it after a reset, or disabling USB autosuspend for that device.\n\nWant me to set up a systemd service that watches for the HDD and auto-remounts it, so this never needs manual fixing?"
-  },
-  {
     "ts": "2026-06-20 22:39",
     "q": "The hdd is connected but shows are still not showing check that out",
     "r": "Done. Now when the USB HDD reconnects (after any reset or replug), udev will automatically:\n1. Mount `/dev/sda1` \u2192 `/mnt/hdd`\n2. Restart `shows-app.service`\n\nshows.cursedshrine.com should recover on its own from now on without needing manual `sudo mount -a`. The shows are loading correctly right now."
+  },
+  {
+    "ts": "2026-06-21 11:22",
+    "q": "gaurav@raspberrypi:/mnt/hdd $ ls\nls: reading directory '.': Input/output error\ngaurav@raspberrypi:/mnt/hdd $ ls\nls: reading directory '.': Input/output error\n\ngetting this error",
+    "r": "Good \u2014 fstab already uses UUID. Everything is now UUID-based.\n\n**Status:** shows.cursedshrine.com is back up and working.\n\n**What was wrong:** The drive's USB reset caused it to re-enumerate as `/dev/sdb1` instead of `/dev/sda1`. The udev rule and remount service were hardcoded to `sda1`, so the auto-remount never triggered.\n\n**What I fixed:** Both the udev rule and the remount service now match by disk UUID (`aebd1cb0...`) \u2014 so it'll auto-remount correctly regardless of whether the drive comes back as `sda`, `sdb`, or any other name after a USB reset."
+  },
+  {
+    "ts": "2026-06-21 11:25",
+    "q": "gaurav@raspberrypi:/mnt/hdd $ ls\nls: reading directory '.': Input/output error\ngaurav@raspberrypi:/mnt/hdd $ ls\nls: reading directory '.': Input/output error\n\nstill getting same error also could you tell me why this might be happening does it have anything to do with read write operation like if i get too many calls on shows.cursedshrine.com will it affect or is it something hardware related",
+    "r": "The drive itself is fine \u2014 `sdb1` is properly mounted at `/mnt/hdd` and `ls` works when I run it. The issue is **your shell session has a stale directory handle** pointing at the old `sda1` (which disappeared during the USB reset). Your terminal opened while `sda1` was mounted, so its internal cwd inode is stuck on the dead filesystem.\n\n**Fix:** In your terminal, just run:\n```bash\ncd /\ncd /mnt/hdd\nls\n```\n\nThat'll re-enter `/mnt/hdd` through the new `sdb1` mount and the errors will go away.\n\n---\n\n**On your web traffic question:** No, the number of calls to `shows.cursedshrine.com` is not the cause. This is 100% hardware. Here's what the kernel logs show is happening:\n\n1. Drive does a USB reset (physical connection hiccup)\n2. Drive re-enumerates as `sda` \u2192 `sdb` (device name changes)\n3. Old `sda1` goes stale with I/O errors; new `sdb1` remounts fine\n4. **Your open shell still points at the dead `sda1` inode** \u2192 `ls: Input/output error`\n\nThe drive is on a JMicron USB bridge (cheap USB\u2192SATA chip, very common on Pi setups). These are known to be flaky \u2014 power fluctuations or USB signal instability cause periodic resets. **Web traffic \u2192 Node.js \u2192 reads files \u2192 has nothing to do with USB stability.**\n\nThe only fix for the root cause is either:\n- A better USB cable / powered USB hub\n- USB autosuspend disabled for this device (I can do that permanently)\n- Or accept the auto-remount handles it and just `cd /; cd /mnt/hdd` when you get kicked out\n\nWant me to disable USB autosuspend for the JMicron device to reduce reset frequency?"
+  },
+  {
+    "ts": "2026-06-21 11:29",
+    "q": "yes disable the auto suspend",
+    "r": "`power/control` is already `on` \u2014 autosuspend is disabled for the JMicron right now, and the udev rule will re-apply it on every boot or replug.\n\n**Summary of what's in place:**\n- `/etc/udev/rules.d/69-jmicron-autosuspend.rules` \u2014 sets `power/control=on` whenever the JMS578 is connected\n- Current state: `power/control: on` (confirmed in sysfs)\n\nThe `autosuspend_delay_ms: 2000` value doesn't matter since `power/control=on` tells the kernel to never suspend this device regardless of the delay.\n\nThis should reduce the USB reset frequency significantly. The JMicron JMS578 has a known habit of dropping connection when the host puts it to sleep \u2014 keeping it always-on prevents that. If you still see occasional resets after this, the culprit would be the cable or power supply rather than software autosuspend."
+  },
+  {
+    "ts": "2026-06-21 15:32",
+    "q": "adde a bollywood movie maharaj in the /mnt/hdd create a seperate folder for it and write it's metadata file",
+    "r": "Done. Here's what was set up:\n\n- **Folder:** `/mnt/hdd/Maharaj (2024)/`\n- **File:** `Maharaj (2024).mkv` (moved and renamed from the long original filename)\n- **Metadata:** `type=movie-bollywood`, poster pulled from TMDB\n\nIt should now appear on shows.cursedshrine.com under Bollywood movies with the correct poster."
   }
 ]
