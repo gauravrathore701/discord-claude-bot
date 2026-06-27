@@ -10,3 +10,4 @@ config.py
 secrets.*
 *.key
 *.pem
+discord-claude.service
