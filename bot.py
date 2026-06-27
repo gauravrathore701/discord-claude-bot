@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import discord
@@ -21,11 +22,9 @@ CLAUDE_BIN   = os.environ.get("CLAUDE_BIN", "/home/gaurav/.local/bin/claude")
 TIMEOUT      = int(os.environ.get("TASK_TIMEOUT", "1200"))  # seconds
 PING_INTERVAL = 120  # seconds between "still working" edits
 
-SESSIONS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".claude", "sessions")
-SESSION_FILE    = os.path.join(SESSIONS_DIR, "current.json")
-MODEL_FILE      = os.path.join(SESSIONS_DIR, "model.json")
-CHAT_HISTORY_FILE = os.path.join(SESSIONS_DIR, "chat_history.json")
-SUMMARY_FILE    = os.path.join(SESSIONS_DIR, "prev_summary.json")
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_ROOT   = os.path.join(BASE_DIR, ".claude", "sessions")
+CHANNELS_FILE   = os.path.join(BASE_DIR, ".claude", "channels.json")
 CHAT_HISTORY_MAX  = 5
 RESET_HOUR      = 4
 RESET_MINUTE    = 45
@@ -38,18 +37,70 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-active_proc: asyncio.subprocess.Process | None = None
-active_task: asyncio.Task | None = None
 
-# Session state
-_session_id: str | None = None
-_session_start: float = 0.0
-_session_last_used: float = 0.0
-_prev_session_id: str | None = None   # previous day's session for context bridging
-_prev_context_injected: bool = False  # inject prev context only once per new session
+# ── multi-channel config ─────────────────────────────────────────────────────
 
-# Model override (None = use the default from ~/.claude/settings.json)
-_model: str | None = None
+@dataclass
+class ChannelConfig:
+    id: int
+    name: str
+    root_dir: str | None        # None => use PROJECTS_DIR with project routing
+    project_routing: bool
+    notes: str                  # extra "important points" appended for this channel
+
+
+@dataclass
+class ChannelState:
+    sessions_dir: str
+    session_id: str | None = None
+    session_start: float = 0.0
+    session_last_used: float = 0.0
+    prev_session_id: str | None = None
+    prev_context_injected: bool = False
+    model: str | None = None
+    active_proc: asyncio.subprocess.Process | None = None
+    active_task: asyncio.Task | None = None
+
+
+def load_channels() -> dict[int, ChannelConfig]:
+    """Load channel configs from .claude/channels.json. The entry with
+    id "__DEFAULT__" is bound to DISCORD_CHANNEL_ID from .env so the original
+    single-channel setup keeps working without editing the JSON file."""
+    try:
+        with open(CHANNELS_FILE) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        raw = [{"id": "__DEFAULT__", "name": "projects", "root_dir": None,
+                "project_routing": True, "notes": ""}]
+
+    channels: dict[int, ChannelConfig] = {}
+    for entry in raw:
+        cid = CHANNEL_ID if entry["id"] == "__DEFAULT__" else int(entry["id"])
+        channels[cid] = ChannelConfig(
+            id=cid,
+            name=entry.get("name", str(cid)),
+            root_dir=entry.get("root_dir"),
+            project_routing=entry.get("project_routing", True),
+            notes=entry.get("notes", ""),
+        )
+    return channels
+
+
+CHANNELS = load_channels()
+STATES: dict[int, ChannelState] = {
+    cid: ChannelState(sessions_dir=os.path.join(SESSIONS_ROOT, str(cid)))
+    for cid in CHANNELS
+}
+
+
+def channel_paths(state: ChannelState) -> dict[str, str]:
+    d = state.sessions_dir
+    return {
+        "session": os.path.join(d, "current.json"),
+        "model": os.path.join(d, "model.json"),
+        "history": os.path.join(d, "chat_history.json"),
+        "summary": os.path.join(d, "prev_summary.json"),
+    }
 
 
 def get_cycle_start() -> float:
@@ -69,87 +120,85 @@ def next_reset_dt() -> datetime:
     return cutoff
 
 
-def session_active() -> bool:
-    return bool(_session_id) and _session_start >= get_cycle_start()
+def session_active(state: ChannelState) -> bool:
+    return bool(state.session_id) and state.session_start >= get_cycle_start()
 
 
-def session_age_str() -> str:
-    if not _session_id:
+def session_age_str(state: ChannelState) -> str:
+    if not state.session_id:
         return "no session"
-    elapsed = int(time.time() - _session_start)
+    elapsed = int(time.time() - state.session_start)
     h, m = divmod(elapsed, 3600)
     ttl_left = int((next_reset_dt() - datetime.now()).total_seconds())
     th, tm = divmod(max(0, ttl_left), 3600)
     return (
-        f"ID: `{_session_id[:8]}…`\n"
+        f"ID: `{state.session_id[:8]}…`\n"
         f"Age: {h}h {m % 60}m\n"
         f"Resets in: {th}h {tm % 60}m (daily at 04:45)"
     )
 
 
-def load_session():
-    global _session_id, _session_start, _session_last_used, _prev_session_id
+def load_session(state: ChannelState):
     try:
-        with open(SESSION_FILE) as f:
+        with open(channel_paths(state)["session"]) as f:
             data = json.load(f)
-        _session_id = data.get("session_id")
-        _session_start = float(data.get("session_start", 0.0))
-        _session_last_used = float(data.get("session_last_used", 0.0))
-        _prev_session_id = data.get("prev_session_id")
-        if not session_active():
+        state.session_id = data.get("session_id")
+        state.session_start = float(data.get("session_start", 0.0))
+        state.session_last_used = float(data.get("session_last_used", 0.0))
+        state.prev_session_id = data.get("prev_session_id")
+        if not session_active(state):
             # current session expired — promote it to prev for context bridging
-            if _session_id:
-                _prev_session_id = _session_id
-            _session_id = None
-            _session_start = 0.0
-            _session_last_used = 0.0
+            if state.session_id:
+                state.prev_session_id = state.session_id
+            state.session_id = None
+            state.session_start = 0.0
+            state.session_last_used = 0.0
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
 
-def save_session():
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    with open(SESSION_FILE, "w") as f:
+def save_session(state: ChannelState):
+    os.makedirs(state.sessions_dir, exist_ok=True)
+    with open(channel_paths(state)["session"], "w") as f:
         json.dump({
-            "session_id": _session_id,
-            "session_start": _session_start,
-            "session_last_used": _session_last_used,
-            "prev_session_id": _prev_session_id,
+            "session_id": state.session_id,
+            "session_start": state.session_start,
+            "session_last_used": state.session_last_used,
+            "prev_session_id": state.prev_session_id,
         }, f, indent=2)
 
 
-def load_summary() -> str:
+def load_summary(state: ChannelState) -> str:
     try:
-        with open(SUMMARY_FILE) as f:
+        with open(channel_paths(state)["summary"]) as f:
             return json.load(f).get("summary", "")
     except (FileNotFoundError, json.JSONDecodeError):
         return ""
 
 
-def save_summary(summary: str):
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    with open(SUMMARY_FILE, "w") as f:
+def save_summary(state: ChannelState, summary: str):
+    os.makedirs(state.sessions_dir, exist_ok=True)
+    with open(channel_paths(state)["summary"], "w") as f:
         json.dump({"summary": summary, "generated_at": datetime.now().isoformat()}, f, indent=2)
 
 
-def load_model():
-    global _model
+def load_model(state: ChannelState):
     try:
-        with open(MODEL_FILE) as f:
-            _model = json.load(f).get("model")
+        with open(channel_paths(state)["model"]) as f:
+            state.model = json.load(f).get("model")
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
 
-def save_model():
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    with open(MODEL_FILE, "w") as f:
-        json.dump({"model": _model}, f, indent=2)
+def save_model(state: ChannelState):
+    os.makedirs(state.sessions_dir, exist_ok=True)
+    with open(channel_paths(state)["model"], "w") as f:
+        json.dump({"model": state.model}, f, indent=2)
 
 
-def load_chat_history() -> list[dict]:
+def load_chat_history(state: ChannelState) -> list[dict]:
     try:
-        with open(CHAT_HISTORY_FILE) as f:
+        with open(channel_paths(state)["history"]) as f:
             data = json.load(f)
         if isinstance(data, list):
             return data[-CHAT_HISTORY_MAX:]
@@ -158,16 +207,16 @@ def load_chat_history() -> list[dict]:
     return []
 
 
-def append_chat_history(query: str, response: str):
-    history = load_chat_history()
+def append_chat_history(state: ChannelState, query: str, response: str):
+    history = load_chat_history(state)
     history.append({
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "q": query[:2000],
         "r": response[:3000],
     })
     history = history[-CHAT_HISTORY_MAX:]
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    with open(CHAT_HISTORY_FILE, "w") as f:
+    os.makedirs(state.sessions_dir, exist_ok=True)
+    with open(channel_paths(state)["history"], "w") as f:
         json.dump(history, f, indent=2)
 
 
@@ -205,88 +254,92 @@ async def fetch_prev_summary(session_id: str) -> str:
         return ""
 
 
-async def do_daily_rollover():
+async def do_daily_rollover(state: ChannelState) -> bool:
     """Summarize the expiring session and rotate it to prev_session_id, ahead of the
     next message — so the new day's first reply already has yesterday's context baked in."""
-    global _session_id, _session_start, _session_last_used, _prev_session_id, _prev_context_injected
-
-    if active_task and not active_task.done():
+    if state.active_task and not state.active_task.done():
         return False  # don't summarize/rotate mid-task; caller retries shortly
 
-    expiring_id = _session_id
+    expiring_id = state.session_id
     if expiring_id:
         summary = await fetch_prev_summary(expiring_id)
         if summary:
-            save_summary(summary)
-        _prev_session_id = expiring_id
+            save_summary(state, summary)
+        state.prev_session_id = expiring_id
 
-    _session_id = None
-    _session_start = 0.0
-    _session_last_used = 0.0
-    _prev_context_injected = False
-    save_session()
+    state.session_id = None
+    state.session_start = 0.0
+    state.session_last_used = 0.0
+    state.prev_context_injected = False
+    save_session(state)
     print(f"[rollover] Session {str(expiring_id)[:8] if expiring_id else '(none)'} summarized and rotated.", flush=True)
     return True
 
 
 async def daily_rollover_loop():
-    """Background task: fire do_daily_rollover() once per day at RESET_HOUR:RESET_MINUTE.
-    If a task is mid-flight at the target time, retry every 30s until it succeeds, rather
-    than waiting for the next day's window."""
+    """Background task: fire do_daily_rollover() for every configured channel once
+    per day at RESET_HOUR:RESET_MINUTE. If a channel's task is mid-flight at the
+    target time, retry that channel every 30s until it succeeds."""
     while True:
         target = next_reset_dt()
         wait_s = max(1.0, (target - datetime.now()).total_seconds())
         await asyncio.sleep(wait_s)
-        while True:
-            try:
-                done = await do_daily_rollover()
-            except Exception as e:
-                print(f"[rollover] failed: {e}", flush=True)
-                done = True  # avoid a tight retry loop on persistent errors
-            if done:
-                break
-            await asyncio.sleep(30)
+        pending = set(STATES.keys())
+        while pending:
+            for cid in list(pending):
+                try:
+                    done = await do_daily_rollover(STATES[cid])
+                except Exception as e:
+                    print(f"[rollover] channel {cid} failed: {e}", flush=True)
+                    done = True  # avoid a tight retry loop on persistent errors
+                if done:
+                    pending.discard(cid)
+            if pending:
+                await asyncio.sleep(30)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def resolve_dir(content: str) -> tuple[str, str]:
+def resolve_dir(cfg: ChannelConfig, content: str) -> tuple[str, str]:
     """
-    If message starts with 'projectname: task', resolve project subdirectory.
+    For channels with project_routing enabled and a message starting with
+    'projectname: task', resolve the project subdirectory under PROJECTS_DIR.
+    Otherwise run in the channel's fixed root_dir (or PROJECTS_DIR).
     Returns (working_dir, task_text).
     """
-    m = re.match(r'^([\w][\w\-_.]*)\s*:\s*(.+)$', content, re.DOTALL)
-    if m:
-        name, task = m.group(1), m.group(2).strip()
-        candidate = os.path.join(PROJECTS_DIR, name)
-        if os.path.isdir(candidate):
-            return candidate, task
-    return PROJECTS_DIR, content
+    base_dir = cfg.root_dir or PROJECTS_DIR
+    if cfg.project_routing:
+        m = re.match(r'^([\w][\w\-_.]*)\s*:\s*(.+)$', content, re.DOTALL)
+        if m:
+            name, task = m.group(1), m.group(2).strip()
+            candidate = os.path.join(base_dir, name)
+            if os.path.isdir(candidate):
+                return candidate, task
+    return base_dir, content
 
 
-async def run_claude(task: str, cwd: str) -> str:
-    global active_proc, _session_id, _session_start, _session_last_used
-    global _prev_session_id, _prev_context_injected
-
+async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: str) -> str:
     # Bridge previous day context into the first message of a new session.
     # Normally daily_rollover_loop() already generated this at 04:45; fall back to a
     # lazy fetch here only if the bot was offline at rollover time and it never ran.
     prev_context_block = ""
-    if not session_active() and _prev_session_id and not _prev_context_injected:
-        summary = load_summary()
+    if not session_active(state) and state.prev_session_id and not state.prev_context_injected:
+        summary = load_summary(state)
         if not summary:
-            summary = await fetch_prev_summary(_prev_session_id)
+            summary = await fetch_prev_summary(state.prev_session_id)
         if summary:
             prev_context_block = (
                 f"[Previous day's session summary — for context]\n{summary}\n\n---\n\n"
             )
-        _prev_context_injected = True
+        state.prev_context_injected = True
 
     # Inject rolling chat history for context continuity
-    history = load_chat_history()
+    history = load_chat_history(state)
     history_block = ""
     if history:
         history_block = format_chat_history(history) + "\n\n---\n\n"
+
+    channel_notes = f"- {cfg.notes}\n" if cfg.notes else ""
 
     task_with_ctx = (
         prev_context_block +
@@ -304,14 +357,15 @@ async def run_claude(task: str, cwd: str) -> str:
         "append it to /home/gaurav/.claude/USER.md under the '<!-- UPDATES -->' section with today's date. "
         "Keep entries concise — one or two lines per fact.\n"
         "- PERSONALITY: Your name is Claudy Rex. Read /home/gaurav/.claude/CLAUDY_REX.md for your full identity and personality. "
-        "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi."
+        "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi.\n"
+        + channel_notes
     )
 
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
-    if _model:
-        cmd += ["--model", _model]
-    if session_active():
-        cmd += ["--resume", _session_id]
+    if state.model:
+        cmd += ["--model", state.model]
+    if session_active(state):
+        cmd += ["--resume", state.session_id]
     cmd += ["-p", task_with_ctx]
 
     proc = await asyncio.create_subprocess_exec(
@@ -321,7 +375,7 @@ async def run_claude(task: str, cwd: str) -> str:
         cwd=cwd,
         env={**os.environ, "TERM": "dumb"},
     )
-    active_proc = proc
+    state.active_proc = proc
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
     except asyncio.TimeoutError:
@@ -329,7 +383,7 @@ async def run_claude(task: str, cwd: str) -> str:
         await proc.communicate()
         return f"Timed out after {TIMEOUT}s."
     finally:
-        active_proc = None
+        state.active_proc = None
 
     raw = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()
@@ -343,11 +397,11 @@ async def run_claude(task: str, cwd: str) -> str:
         new_sid = data.get("session_id")
         if new_sid:
             now = time.time()
-            if not _session_id:
-                _session_start = now
-            _session_id = new_sid
-            _session_last_used = now
-            save_session()
+            if not state.session_id:
+                state.session_start = now
+            state.session_id = new_sid
+            state.session_last_used = now
+            save_session(state)
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -355,7 +409,7 @@ async def run_claude(task: str, cwd: str) -> str:
         out += f"\n\n[stderr]\n{err}"
 
     final_out = out or "(no output)"
-    append_chat_history(task, final_out)
+    append_chat_history(state, task, final_out)
     return final_out
 
 
@@ -404,23 +458,27 @@ _rollover_task: asyncio.Task | None = None
 @client.event
 async def on_ready():
     global _rollover_task
-    load_session()
-    load_model()
+    for state in STATES.values():
+        load_session(state)
+        load_model(state)
     print(f"Online as {client.user}", flush=True)
+    print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
     if _rollover_task is None or _rollover_task.done():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
-    ch = client.get_channel(CHANNEL_ID)
-    if ch:
-        await ch.send("Claude Code bot is online. Send a task or type `!help`.")
+    for cid, cfg in CHANNELS.items():
+        ch = client.get_channel(cid)
+        if ch:
+            await ch.send(f"Claude Code bot is online ({cfg.name}). Send a task or type `!help`.")
 
 
 @client.event
 async def on_message(message: discord.Message):
-    global active_task
+    cfg = CHANNELS.get(message.channel.id)
+    if cfg is None:
+        return
+    state = STATES[cfg.id]
 
     if message.author.bot:
-        return
-    if message.channel.id != CHANNEL_ID:
         return
     if message.author.id not in ALLOWED_IDS:
         await message.reply("Unauthorized.")
@@ -441,8 +499,13 @@ async def on_message(message: discord.Message):
 
     # ── built-in commands ────────────────────────────────────────────────────
     if text.lower() == "!help":
+        project_help = (
+            "To target a specific project: `projectname: your task here`\n\n"
+            if cfg.project_routing else
+            f"This channel always runs in `{cfg.root_dir}`.\n\n"
+        )
         await message.reply(
-            "**Commands**\n"
+            f"**Commands** (channel: `{cfg.name}`)\n"
             "`!help` — show this\n"
             "`!projects` — list projects in PROJECTS_DIR\n"
             "`!cancel` — kill the running task\n"
@@ -451,10 +514,9 @@ async def on_message(message: discord.Message):
             "`!newsession` — start a fresh Claude session\n"
             "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n\n"
             "**Running a task**\n"
-            "Just type your task. Claude runs in `PROJECTS_DIR`.\n"
-            "To target a specific project: `projectname: your task here`\n\n"
+            f"Just type your task. {project_help}"
             "**Sessions**\n"
-            "Claude remembers context within each day. "
+            "Claude remembers context within each day, per channel. "
             "Sessions reset automatically at 04:45 every morning, or use `!newsession`."
         )
         return
@@ -464,28 +526,26 @@ async def on_message(message: discord.Message):
         return
 
     if text.lower() == "!session":
-        status_line = "Active" if session_active() else "Expired / none"
-        await message.reply(f"**Session status:** {status_line}\n{session_age_str()}")
+        status_line = "Active" if session_active(state) else "Expired / none"
+        await message.reply(f"**Session status:** {status_line}\n{session_age_str(state)}")
         return
 
     if text.lower() == "!newsession":
-        global _session_id, _session_start, _session_last_used, _prev_context_injected
-        if _session_id:
-            _prev_session_id = _session_id
-        _session_id = None
-        _session_start = 0.0
-        _session_last_used = 0.0
-        _prev_context_injected = False
-        save_session()
+        if state.session_id:
+            state.prev_session_id = state.session_id
+        state.session_id = None
+        state.session_start = 0.0
+        state.session_last_used = 0.0
+        state.prev_context_injected = False
+        save_session(state)
         await message.reply("Session cleared. Next message starts a fresh conversation.")
         return
 
     m = re.match(r'^!?model(?:\s+(\S+))?$', text, re.IGNORECASE)
     if m:
-        global _model
         arg = m.group(1)
         if not arg:
-            current = _model or "default"
+            current = state.model or "default"
             await message.reply(
                 f"Current model: `{current}`\n"
                 f"Usage: `model <{'|'.join(sorted(MODEL_ALIASES))}|default>`"
@@ -493,36 +553,36 @@ async def on_message(message: discord.Message):
             return
         choice = arg.lower()
         if choice == "default":
-            _model = None
+            state.model = None
         elif choice in MODEL_ALIASES:
-            _model = choice
+            state.model = choice
         else:
             await message.reply(
                 f"Unknown model `{arg}`. Valid: {', '.join(sorted(MODEL_ALIASES))}, default"
             )
             return
-        save_model()
-        await message.reply(f"Model set to `{_model or 'default'}`. Applies to the next message.")
+        save_model(state)
+        await message.reply(f"Model set to `{state.model or 'default'}`. Applies to the next message.")
         return
 
     if text.lower() in ("!cancel", "!stop"):
-        if active_proc:
-            active_proc.kill()
-        if active_task and not active_task.done():
-            active_task.cancel()
+        if state.active_proc:
+            state.active_proc.kill()
+        if state.active_task and not state.active_task.done():
+            state.active_task.cancel()
             await message.reply("Cancelled.")
         else:
             await message.reply("Nothing is running.")
         return
 
     if text.lower() == "!status":
-        running = active_task and not active_task.done()
+        running = state.active_task and not state.active_task.done()
         await message.reply("A task is running." if running else "Idle.")
         return
 
-    # ── reject concurrent tasks ──────────────────────────────────────────────
-    if active_task and not active_task.done():
-        await message.reply("Already running a task. Use `!cancel` to stop it first.")
+    # ── reject concurrent tasks (per channel) ────────────────────────────────
+    if state.active_task and not state.active_task.done():
+        await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
         return
 
     # ── download image attachments to temp files ─────────────────────────────
@@ -547,7 +607,7 @@ async def on_message(message: discord.Message):
         file_paths.append((fname, tmp.name))
 
     # ── dispatch task ────────────────────────────────────────────────────────
-    cwd, task = resolve_dir(text)
+    cwd, task = resolve_dir(cfg, text)
 
     if image_paths:
         img_note = "\n".join(
@@ -569,7 +629,7 @@ async def on_message(message: discord.Message):
         ping = asyncio.create_task(progress_ping(status, cwd))
         try:
             async with message.channel.typing():
-                output = await run_claude(task, cwd)
+                output = await run_claude(cfg, state, task, cwd)
             ping.cancel()
             try:
                 await status.delete()
@@ -595,7 +655,7 @@ async def on_message(message: discord.Message):
                 except OSError:
                     pass
 
-    active_task = asyncio.create_task(do_task())
+    state.active_task = asyncio.create_task(do_task())
 
 
 if __name__ == "__main__":

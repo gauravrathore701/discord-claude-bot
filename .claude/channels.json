@@ -1,0 +1,16 @@
+[
+  {
+    "id": "__DEFAULT__",
+    "name": "projects",
+    "root_dir": null,
+    "project_routing": true,
+    "notes": ""
+  },
+  {
+    "id": "1508034882645786644",
+    "name": "obsidian",
+    "root_dir": "/home/gaurav/Documents/ObsidianVault",
+    "project_routing": false,
+    "notes": "This channel is grounded in Gaurav's personal Obsidian vault at /home/gaurav/Documents/ObsidianVault. Treat its notes/files as the primary context for conversation here — read relevant notes before answering, and if asked to jot something down, write it as a note in this vault rather than elsewhere."
+  }
+]
