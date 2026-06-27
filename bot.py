@@ -25,6 +25,7 @@ SESSIONS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cla
 SESSION_FILE    = os.path.join(SESSIONS_DIR, "current.json")
 MODEL_FILE      = os.path.join(SESSIONS_DIR, "model.json")
 CHAT_HISTORY_FILE = os.path.join(SESSIONS_DIR, "chat_history.json")
+SUMMARY_FILE    = os.path.join(SESSIONS_DIR, "prev_summary.json")
 CHAT_HISTORY_MAX  = 5
 RESET_HOUR      = 4
 RESET_MINUTE    = 45
@@ -117,6 +118,20 @@ def save_session():
         }, f, indent=2)
 
 
+def load_summary() -> str:
+    try:
+        with open(SUMMARY_FILE) as f:
+            return json.load(f).get("summary", "")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+
+
+def save_summary(summary: str):
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    with open(SUMMARY_FILE, "w") as f:
+        json.dump({"summary": summary, "generated_at": datetime.now().isoformat()}, f, indent=2)
+
+
 def load_model():
     global _model
     try:
@@ -190,6 +205,49 @@ async def fetch_prev_summary(session_id: str) -> str:
         return ""
 
 
+async def do_daily_rollover():
+    """Summarize the expiring session and rotate it to prev_session_id, ahead of the
+    next message — so the new day's first reply already has yesterday's context baked in."""
+    global _session_id, _session_start, _session_last_used, _prev_session_id, _prev_context_injected
+
+    if active_task and not active_task.done():
+        return False  # don't summarize/rotate mid-task; caller retries shortly
+
+    expiring_id = _session_id
+    if expiring_id:
+        summary = await fetch_prev_summary(expiring_id)
+        if summary:
+            save_summary(summary)
+        _prev_session_id = expiring_id
+
+    _session_id = None
+    _session_start = 0.0
+    _session_last_used = 0.0
+    _prev_context_injected = False
+    save_session()
+    print(f"[rollover] Session {str(expiring_id)[:8] if expiring_id else '(none)'} summarized and rotated.", flush=True)
+    return True
+
+
+async def daily_rollover_loop():
+    """Background task: fire do_daily_rollover() once per day at RESET_HOUR:RESET_MINUTE.
+    If a task is mid-flight at the target time, retry every 30s until it succeeds, rather
+    than waiting for the next day's window."""
+    while True:
+        target = next_reset_dt()
+        wait_s = max(1.0, (target - datetime.now()).total_seconds())
+        await asyncio.sleep(wait_s)
+        while True:
+            try:
+                done = await do_daily_rollover()
+            except Exception as e:
+                print(f"[rollover] failed: {e}", flush=True)
+                done = True  # avoid a tight retry loop on persistent errors
+            if done:
+                break
+            await asyncio.sleep(30)
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def resolve_dir(content: str) -> tuple[str, str]:
@@ -210,10 +268,14 @@ async def run_claude(task: str, cwd: str) -> str:
     global active_proc, _session_id, _session_start, _session_last_used
     global _prev_session_id, _prev_context_injected
 
-    # Bridge previous day context into the first message of a new session
+    # Bridge previous day context into the first message of a new session.
+    # Normally daily_rollover_loop() already generated this at 04:45; fall back to a
+    # lazy fetch here only if the bot was offline at rollover time and it never ran.
     prev_context_block = ""
     if not session_active() and _prev_session_id and not _prev_context_injected:
-        summary = await fetch_prev_summary(_prev_session_id)
+        summary = load_summary()
+        if not summary:
+            summary = await fetch_prev_summary(_prev_session_id)
         if summary:
             prev_context_block = (
                 f"[Previous day's session summary — for context]\n{summary}\n\n---\n\n"
@@ -336,11 +398,17 @@ def list_projects() -> str:
 
 # ── bot events ────────────────────────────────────────────────────────────────
 
+_rollover_task: asyncio.Task | None = None
+
+
 @client.event
 async def on_ready():
+    global _rollover_task
     load_session()
     load_model()
     print(f"Online as {client.user}", flush=True)
+    if _rollover_task is None or _rollover_task.done():
+        _rollover_task = asyncio.create_task(daily_rollover_loop())
     ch = client.get_channel(CHANNEL_ID)
     if ch:
         await ch.send("Claude Code bot is online. Send a task or type `!help`.")
