@@ -98,7 +98,7 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/home/gaurav/.local/bin/claude")
 WORK_DIR = os.environ.get("VOICE_WORK_DIR", "/home/gaurav/Projects")
 
 PIPER_BIN = str(BASE_DIR / "venv" / "bin" / "piper")
-PIPER_MODEL = str(BASE_DIR / "models" / "en_US-lessac-medium.onnx")
+PIPER_MODEL = str(BASE_DIR / "models" / os.environ.get("VOICE_TTS_VOICE", "en_US-hfc_female-medium.onnx"))
 CHIME = {n: str(BASE_DIR / "models" / f"chime_{n}.wav") for n in ("ready", "thinking", "error")}
 SESSIONS_DIR = BASE_DIR / ".claude-sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
@@ -143,9 +143,12 @@ def _save_session(guild_id: int, session_id: str | None):
 def ask_claude(guild_id: int, text: str) -> str:
     prompt = (
         f"(Voice message from Gaurav, auto-transcribed — may contain small mis-hears)\n{text}\n\n"
-        "IMPORTANT: your reply will be spoken aloud by TTS. Answer in short, plain,"
-        " conversational sentences. No markdown, no code blocks, no lists, no emojis."
-        " Keep it to a few sentences unless more detail is explicitly requested."
+        "IMPORTANT: your reply will be spoken aloud by TTS. Talk like a friendly person"
+        " chatting, not a report: use contractions, everyday words, and short natural"
+        " sentences. It's fine to open with a brief acknowledgement (like 'sure' or"
+        " 'okay so') when it fits. No markdown, no code blocks, no lists, no emojis,"
+        " and don't spell out symbols or paths unless asked. Keep it to a few sentences"
+        " unless more detail is explicitly requested."
     )
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
     if VOICE_MODEL:
