@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 import discord
 from dotenv import load_dotenv
 
+from media import MediaPlayer
+
 load_dotenv()
 
 TOKEN        = os.environ["DISCORD_TOKEN"]
@@ -36,6 +38,9 @@ DISCORD_LIMIT = 1900
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+
+# Single shared media player (one physical monitor/audio output on the Pi).
+MEDIA = MediaPlayer(log=lambda m: print(m, flush=True))
 
 
 # ── multi-channel config ─────────────────────────────────────────────────────
@@ -513,6 +518,14 @@ async def on_message(message: discord.Message):
             "`!session` — show current session info\n"
             "`!newsession` — start a fresh Claude session\n"
             "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n\n"
+            "**Media / monitor** (YouTube in a browser on the Pi's HDMI monitor)\n"
+            "`!play <song or url>` — play (audio focus, doesn't wake the screen)\n"
+            "`!video <query or url>` — play and wake the monitor\n"
+            "`!pause` / `!resume` — pause / resume playback\n"
+            "`!mstop` — stop playback\n"
+            "`!np` — now playing / display status\n"
+            "`!wake` / `!sleep` — turn the HDMI output on / off\n"
+            "_(browser closes + screen blanks after 30 min idle; play/wake restores)_\n\n"
             "**Running a task**\n"
             f"Just type your task. {project_help}"
             "**Sessions**\n"
@@ -578,6 +591,49 @@ async def on_message(message: discord.Message):
     if text.lower() == "!status":
         running = state.active_task and not state.active_task.done()
         await message.reply("A task is running." if running else "Idle.")
+        return
+
+    # ── media / display commands (shared single monitor, run independently) ───
+    low = text.lower()
+    m_play = re.match(r'^!(play|video|playvideo)\s+(.+)$', text, re.IGNORECASE | re.DOTALL)
+    if m_play:
+        video = m_play.group(1).lower() in ("video", "playvideo")
+        query = m_play.group(2).strip()
+        async with message.channel.typing():
+            ok, info = await MEDIA.play(query, video=video)
+        if ok:
+            await message.reply(f"{'📺' if video else '🎵'} Now playing: **{info}**")
+        else:
+            await message.reply(f"⚠️ {info}")
+        return
+
+    if low in ("!mstop", "!stopmusic", "!mediastop"):
+        was = await MEDIA.stop()
+        await message.reply("⏹ Stopped." if was else "Nothing was playing.")
+        return
+
+    if low == "!pause":
+        ok = await MEDIA.pause()
+        await message.reply("⏸ Paused." if ok else "Nothing to pause.")
+        return
+
+    if low == "!resume":
+        ok = await MEDIA.resume()
+        await message.reply("▶ Resumed." if ok else "Nothing to resume.")
+        return
+
+    if low in ("!wake", "!screenon"):
+        ok, msg = await MEDIA.display(True)
+        await message.reply(f"🖥️ {msg}" if ok else f"⚠️ {msg}")
+        return
+
+    if low in ("!sleep", "!screenoff"):
+        ok, msg = await MEDIA.display(False)
+        await message.reply(f"🌙 {msg}" if ok else f"⚠️ {msg}")
+        return
+
+    if low in ("!np", "!nowplaying", "!mstatus"):
+        await message.reply(await MEDIA.status())
         return
 
     # ── reject concurrent tasks (per channel) ────────────────────────────────
