@@ -363,6 +363,16 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         "Keep entries concise — one or two lines per fact.\n"
         "- PERSONALITY: Your name is Claudy Rex. Read /home/gaurav/.claude/CLAUDY_REX.md for your full identity and personality. "
         "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi.\n"
+        "- BOT RESTART RULE: Before running `systemctl restart discord-claude`, ALWAYS: (1) summarize every change made, (2) explicitly ask Gaurav for confirmation. Never restart silently or as a side-effect. Wait for a clear yes before restarting.\n"
+        "- MONITOR / YOUTUBE CONTROL (works from ANY channel): the Pi drives a physical monitor via a persistent "
+        "Chromium kiosk (flip-clock when idle). When Gaurav asks in plain language to play/show something on the "
+        "monitor/screen/TV, control the screen, pause/resume, or turn the display on/off, translate the intent and RUN:\n"
+        "    python3 /home/gaurav/Projects/discord-claude-bot/mediactl.py <cmd> [args]\n"
+        "  Commands: `video <query|url>` (show on screen, fullscreen), `play <query|url>` (audio only, screen stays off), "
+        "`stop` (back to clock), `pause`, `resume`, `fullscreen`, `wake`, `sleep`, `status`. "
+        "It prints one JSON line — report the result. Examples: 'play arijit songs on the tv' → `mediactl.py video arijit singh songs`; "
+        "'pause the screen' → `mediactl.py pause`; 'turn the monitor off' → `mediactl.py sleep`. "
+        "Interpret rough requests yourself; don't tell Gaurav to type raw `!` commands.\n"
         + channel_notes
     )
 
@@ -470,6 +480,7 @@ async def on_ready():
     print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
     if _rollover_task is None or _rollover_task.done():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
+    asyncio.create_task(MEDIA.startup())   # launch clock screen in background
     for cid, cfg in CHANNELS.items():
         ch = client.get_channel(cid)
         if ch:

@@ -2,23 +2,24 @@
 """
 Browser-based media playback + HDMI display control for the Discord bot.
 
-v2 — Chromium kiosk + CDP (replaces the v1 yt-dlp|cvlc pipeline at Gaurav's request:
-he wants real YouTube in a browser on the monitor).
+v4 — always-on flip clock idle screen.
 
-The Pi 5 boots to a labwc Wayland desktop (auto-login as gaurav, uid 1000); the bot
-runs as the same user, so it launches Chromium into that session and drives it over
-the DevTools protocol (CDP, port 9222): navigate to YouTube, click nothing, read the
-<video> element, pause/resume it. No LLM or keystroke faking in the loop.
+cage + Chromium start at bot startup showing a local flip-clock page
+(static/flipclock.html). On !play/!video the browser navigates to YouTube;
+on !stop it navigates back to the clock. cage stays alive permanently so the
+monitor always shows the clock when nothing plays. Screen blanks after
+MEDIA_IDLE_TIMEOUT seconds (wlr-randr off); !wake restores it and re-shows
+the clock.
 
-Display on/off stays `wlr-randr --output HDMI-A-2 --on/--off` (vcgencmd display_power
-is not registered on Pi 5). Idle blanking: after IDLE_TIMEOUT with nothing playing,
-the HDMI output is blanked AND the browser is closed to free RAM.
+Display control:
+  - cage running  → `wlr-randr --output <conn> --on/--off` against cage's socket
+  - cage stopped  → blanking via a held `kmsblank --device=<card>` process
+kmsblank holds DRM master, so it must die before cage can start.
 
-Audio goes to the default PipeWire sink — the monitor's HDMI sink ("Built-in Audio
-Digital Stereo (HDMI)"), which appears once the monitor is attached. If it's missing
-after a hotplug, `systemctl --user restart wireplumber` rescans it.
+Audio goes to the default PipeWire sink (monitor HDMI).
 """
 import asyncio
+import glob
 import json
 import os
 import signal
@@ -28,35 +29,52 @@ import urllib.parse
 import aiohttp
 
 UID = 1000
-WL_ENV = {
-    **os.environ,
+ENV = {
+    **{k: v for k, v in os.environ.items() if k != "WAYLAND_DISPLAY"},
     "XDG_RUNTIME_DIR": f"/run/user/{UID}",
-    "WAYLAND_DISPLAY": os.environ.get("MEDIA_WAYLAND_DISPLAY", "wayland-0"),
     "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{UID}/bus",
 }
+# cage creates its own socket; wayland-0 since it's the only compositor here.
+CAGE_WL_DISPLAY = os.environ.get("MEDIA_WAYLAND_DISPLAY", "wayland-0")
+CAGE_ENV = {**ENV, "WAYLAND_DISPLAY": CAGE_WL_DISPLAY}
 
+CAGE = os.environ.get("MEDIA_CAGE_BIN", "/usr/bin/cage")
 CHROMIUM = os.environ.get("MEDIA_BROWSER_BIN", "/usr/bin/chromium")
+KMSBLANK = os.environ.get("MEDIA_KMSBLANK_BIN", "/usr/bin/kmsblank")
 CDP_PORT = int(os.environ.get("MEDIA_CDP_PORT", "9222"))
 CDP = f"http://127.0.0.1:{CDP_PORT}"
-PROFILE_DIR = os.path.expanduser("~/.config/chromium-media")  # separate from openclaw's profile
+PROFILE_DIR = os.path.expanduser("~/.config/chromium-media")
 
 IDLE_TIMEOUT = int(os.environ.get("MEDIA_IDLE_TIMEOUT", str(30 * 60)))  # seconds
 IDLE_POLL = 60
 WATCH_POLL = 10  # ad-skip / activity watcher interval while media is up
 
-BROWSER_FLAGS = [
+CLOCK_URL = os.environ.get(
+    "MEDIA_CLOCK_URL",
+    "file://" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "flipclock.html"),
+)
+
+CHROMIUM_FLAGS = [
     "--kiosk", "--noerrdialogs", "--disable-infobars", "--no-first-run",
-    # Explicit wayland: with --remote-debugging-port set, the "auto" hint
-    # falls back to X11 (no X server here) and Chromium exits immediately.
     "--ozone-platform=wayland",
     "--autoplay-policy=no-user-gesture-required",
+    # basic = plaintext profile store; keeps gnome-keyring from popping a
+    # "choose password for new keyring" dialog on a screen with no keyboard
+    "--password-store=basic",
     f"--remote-debugging-port={CDP_PORT}",
     f"--user-data-dir={PROFILE_DIR}",
 ]
 
-JS_FIRST_RESULT = (
-    "document.querySelector('ytd-video-renderer a#video-title')?.href || null"
-)
+# Organic results only: ytd-video-renderer skips ad slots. The fallback scans
+# all /watch links but drops ones inside ad renderers or off-site redirects.
+JS_FIRST_RESULT = """(()=>{
+  const a = document.querySelector('ytd-video-renderer a#video-title');
+  if (a && a.href) return a.href;
+  const bad = 'ytd-ad-slot-renderer,ytd-promoted-video-renderer,ytd-in-feed-ad-layout-renderer';
+  const hit = Array.from(document.querySelectorAll('a[href*="/watch?v="]'))
+    .find(x => x.href.startsWith('https://www.youtube.com/watch') && !x.closest(bad));
+  return hit ? hit.href : null;
+})()"""
 JS_PLAYING = (
     "(()=>{const v=document.querySelector('video');"
     "return !!(v && !v.paused && !v.ended && v.readyState > 2)})()"
@@ -66,12 +84,33 @@ JS_SKIP_AD = (
     ".ytp-ad-skip-button-modern')?.click()"
 )
 JS_TITLE = "document.title.replace(/ - YouTube$/, '')"
+JS_FULLSCREEN = (
+    "(()=>{ const v=document.querySelector('video');"
+    " if(v){v.requestFullscreen().catch(()=>{});return true;}"
+    " document.querySelector('.ytp-fullscreen-button')?.click(); return false;})()"
+)
+
+
+def hdmi_connector() -> tuple[str, str] | None:
+    """Return (connector_name, /dev/dri/cardN) for the connected HDMI, from sysfs."""
+    for path in sorted(glob.glob("/sys/class/drm/card*-HDMI-A-*")):
+        try:
+            with open(f"{path}/status") as f:
+                if f.read().strip() != "connected":
+                    continue
+        except OSError:
+            continue
+        base = os.path.basename(path)          # e.g. card1-HDMI-A-2
+        card, conn = base.split("-", 1)        # "card1", "HDMI-A-2"
+        return conn, f"/dev/dri/{card}"
+    return None
 
 
 class MediaPlayer:
     def __init__(self, log=print):
         self.log = log
-        self.proc: asyncio.subprocess.Process | None = None  # chromium
+        self.proc: asyncio.subprocess.Process | None = None   # cage (chromium inside)
+        self.blank_proc: asyncio.subprocess.Process | None = None  # kmsblank
         self.title: str | None = None
         self.is_video = False
         self.started_at = 0.0
@@ -94,7 +133,7 @@ class MediaPlayer:
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return False
 
-    async def _eval(self, js: str, timeout=10):
+    async def _eval(self, js: str, timeout=10, user_gesture=False):
         """Runtime.evaluate on the first page target; returns the JS value or None."""
         try:
             async with aiohttp.ClientSession() as s:
@@ -107,7 +146,8 @@ class MediaPlayer:
                 async with s.ws_connect(page["webSocketDebuggerUrl"]) as ws:
                     await ws.send_json({
                         "id": 1, "method": "Runtime.evaluate",
-                        "params": {"expression": js, "returnByValue": True},
+                        "params": {"expression": js, "returnByValue": True,
+                                   "userGesture": user_gesture},
                     })
                     deadline = time.monotonic() + timeout
                     while time.monotonic() < deadline:
@@ -132,7 +172,7 @@ class MediaPlayer:
             await asyncio.sleep(every)
         return None
 
-    # ── browser lifecycle ────────────────────────────────────────────────────
+    # ── browser (cage) lifecycle ─────────────────────────────────────────────
     def browser_alive(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
 
@@ -140,16 +180,20 @@ class MediaPlayer:
         if self.browser_alive() and await self._cdp_up():
             return True
         await self._kill_browser()
+        await self._kill_blank()  # kmsblank holds DRM master; cage needs it
         self.proc = await asyncio.create_subprocess_exec(
-            CHROMIUM, *BROWSER_FLAGS, "about:blank",
-            env=WL_ENV, start_new_session=True,
+            CAGE, "--", CHROMIUM, *CHROMIUM_FLAGS, CLOCK_URL,
+            env=ENV, start_new_session=True,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        for _ in range(30):  # up to 15s for CDP to come up
+        for _ in range(40):  # up to 20s: cage + chromium + CDP
             await asyncio.sleep(0.5)
             if await self._cdp_up():
+                self.display_on = True  # cage lights the output when it takes over
                 self._ensure_idle_loop()
                 return True
+            if self.proc.returncode is not None:
+                break
         await self._kill_browser()
         return False
 
@@ -172,46 +216,79 @@ class MediaPlayer:
         self.proc = None
         self.title = None
         self.is_video = False
+        self.display_on = True  # console is visible again once cage exits
+
+    # ── kmsblank lifecycle (console blanking while no compositor runs) ──────
+    def _blank_alive(self) -> bool:
+        return self.blank_proc is not None and self.blank_proc.returncode is None
+
+    async def _start_blank(self, card: str) -> bool:
+        if self._blank_alive():
+            return True
+        self.blank_proc = await asyncio.create_subprocess_exec(
+            KMSBLANK, f"--device={card}",
+            env=ENV, stdin=asyncio.subprocess.DEVNULL,  # waits for enter = stays blank
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.sleep(1)
+        return self.blank_proc.returncode is None
+
+    async def _kill_blank(self):
+        if self._blank_alive():
+            self.blank_proc.terminate()
+            try:
+                await asyncio.wait_for(self.blank_proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self.blank_proc.kill()
+        self.blank_proc = None
 
     # ── display control ──────────────────────────────────────────────────────
-    async def hdmi_output(self) -> str | None:
-        proc = await asyncio.create_subprocess_exec(
-            "wlr-randr", env=WL_ENV,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return None
-        for line in out.decode(errors="replace").splitlines():
-            if line and not line[0].isspace() and line.split()[0].upper().startswith("HDMI"):
-                return line.split()[0]
-        return None
-
-    async def display(self, on: bool) -> tuple[bool, str]:
-        conn = await self.hdmi_output()
-        if not conn:
-            return False, "No HDMI output detected — is the monitor plugged in?"
+    async def _wlr_randr(self, conn: str, on: bool) -> bool:
         proc = await asyncio.create_subprocess_exec(
             "wlr-randr", "--output", conn, "--on" if on else "--off",
-            env=WL_ENV, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            env=CAGE_ENV,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
-        ok = proc.returncode == 0
+        return proc.returncode == 0
+
+    async def display(self, on: bool) -> tuple[bool, str]:
+        hdmi = hdmi_connector()
+        if not hdmi:
+            return False, "No HDMI output detected — is the monitor plugged in?"
+        conn, card = hdmi
+        if self.browser_alive():
+            ok = await self._wlr_randr(conn, on)
+            if ok and on and not self.title:
+                await self._navigate(CLOCK_URL)   # wake → show clock
+            how = "compositor"
+        elif on:
+            await self._kill_blank()
+            ok, how = True, "console"
+        else:
+            ok = await self._start_blank(card)
+            how = "console"
         if ok:
             self.display_on = on
             self.touch()
-        return ok, (f"{conn} → {'on' if on else 'off'}" if ok else "wlr-randr failed")
+            return True, f"{conn} → {'on' if on else 'off'} ({how})"
+        return False, f"Couldn't switch {conn} {'on' if on else 'off'}"
 
     # ── playback ─────────────────────────────────────────────────────────────
     async def play(self, query: str, video: bool = False) -> tuple[bool, str]:
         async with self._lock:
-            if video:
-                ok, msg = await self.display(True)
-                if not ok:
-                    return False, f"Can't show video — {msg}"
+            if video and not hdmi_connector():
+                return False, "Can't show video — no HDMI output detected."
 
+            was_off = not self.display_on
             if not await self._ensure_browser():
-                return False, "Browser failed to start (CDP never came up)."
+                return False, "Browser failed to start (cage/CDP never came up)."
+
+            # audio focus keeps the screen dark if it was dark before
+            if not video and was_off:
+                hdmi = hdmi_connector()
+                if hdmi and await self._wlr_randr(hdmi[0], False):
+                    self.display_on = False
 
             q = query.strip()
             if q.startswith(("http://", "https://")):
@@ -225,9 +302,21 @@ class MediaPlayer:
                 if not url:
                     return False, f"No YouTube result found for: {q}"
 
+            if video and not self.display_on:
+                hdmi = hdmi_connector()
+                if hdmi:
+                    await self._wlr_randr(hdmi[0], True)
+                    self.display_on = True
+
             await self._navigate(url)
             started = await self._poll_eval(JS_PLAYING, total=25)
             title = await self._eval(JS_TITLE) or q
+
+            if started:
+                # fullscreen always — kiosk flag keeps browser full-window but
+                # the YouTube player itself still needs requestFullscreen()
+                await asyncio.sleep(1)
+                await self._eval(JS_FULLSCREEN, user_gesture=True)
 
             self.title = title
             self.is_video = video
@@ -256,10 +345,10 @@ class MediaPlayer:
     async def stop(self) -> bool:
         async with self._lock:
             was = bool(self.title) and await self._eval(JS_PLAYING)
-            if self.browser_alive():
-                await self._navigate("about:blank")
             self.title = None
             self.is_video = False
+            if self.browser_alive():
+                await self._navigate(CLOCK_URL)   # back to clock; cage stays alive
             self.touch()
             return bool(was)
 
@@ -281,12 +370,24 @@ class MediaPlayer:
             await asyncio.sleep(IDLE_POLL)
             if (time.monotonic() - self.last_activity) < IDLE_TIMEOUT:
                 continue
-            if self.browser_alive():
-                self.log("[media] idle timeout — closing browser")
-                await self._kill_browser()
+            if self.title and self.browser_alive():
+                self.log("[media] idle timeout — returning to clock")
+                self.title = None
+                self.is_video = False
+                await self._navigate(CLOCK_URL)
             if self.display_on:
-                self.log("[media] idle timeout — blanking HDMI output")
+                self.log("[media] idle timeout — blanking HDMI")
                 await self.display(False)
+
+    # ── startup ──────────────────────────────────────────────────────────────
+    async def startup(self):
+        """Start cage+Chromium at the clock screen. Non-fatal if a desktop already owns DRM."""
+        if self.browser_alive():
+            return
+        self.log("[media] startup: launching clock screen")
+        ok = await self._ensure_browser()
+        if not ok:
+            self.log("[media] startup: cage failed to start (desktop may own DRM — will retry on first !play)")
 
     # ── status ───────────────────────────────────────────────────────────────
     async def status(self) -> str:
@@ -300,5 +401,7 @@ class MediaPlayer:
             return f"{state} ({mode}): **{self.title}** — {m}m{s:02d}s\n{disp}"
         idle = int(time.monotonic() - self.last_activity)
         left = max(0, IDLE_TIMEOUT - idle) // 60
-        tail = f" (browser+screen close in ~{left}m if idle)" if (self.display_on or self.browser_alive()) else ""
-        return f"⏹ Nothing playing.\n{disp}{tail}"
+        tail = f" (blanks in ~{left}m)" if self.display_on else ""
+        if self.browser_alive():
+            return f"🕐 Clock screen active.\n{disp}{tail}"
+        return f"⏹ Nothing playing (clock offline).\n{disp}{tail}"
