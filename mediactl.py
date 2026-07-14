@@ -42,6 +42,21 @@ CLOCK_URL = os.environ.get(
 )
 
 JS_FIRST_RESULT = """(()=>{
+  // Primary: extract from ytInitialData (works even when DOM isn't hydrated)
+  try {
+    const d = window.ytInitialData;
+    const contents = d?.contents?.twoColumnSearchResultsRenderer?.primaryContents
+                      ?.sectionListRenderer?.contents;
+    if (contents) {
+      for (const section of contents) {
+        const items = section?.itemSectionRenderer?.contents;
+        if (!items) continue;
+        const vid = items.find(i => i.videoRenderer && i.videoRenderer.videoId);
+        if (vid) return 'https://www.youtube.com/watch?v=' + vid.videoRenderer.videoId;
+      }
+    }
+  } catch(e) {}
+  // Fallback: DOM-based (for future YouTube versions that render normally)
   const a = document.querySelector('ytd-video-renderer a#video-title');
   if (a && a.href) return a.href;
   const bad = 'ytd-ad-slot-renderer,ytd-promoted-video-renderer,ytd-in-feed-ad-layout-renderer';
@@ -245,6 +260,85 @@ def cmd_fullscreen():
     return ok("fullscreen", requested=bool(r))
 
 
+# ── audio track ──────────────────────────────────────────────────────────────
+JS_AUDIO_TRACKS = """(()=>{
+  const p = document.querySelector('#movie_player');
+  if (!p || typeof p.getAvailableAudioTracks !== 'function') return null;
+  return JSON.stringify(p.getAvailableAudioTracks().map(t => ({
+    id: t.id, name: t.kk?.name || '', langId: t.kk?.id || '',
+    isDefault: t.kk?.isDefault || false, isAutoDubbed: t.kk?.isAutoDubbed || false
+  })));
+})()"""
+
+JS_CURRENT_AUDIO = """(()=>{
+  const p = document.querySelector('#movie_player');
+  if (!p || typeof p.getAudioTrack !== 'function') return null;
+  const t = p.getAudioTrack();
+  return JSON.stringify({id: t.id, name: t.kk?.name || '', langId: t.kk?.id || '',
+    isDefault: t.kk?.isDefault || false, isAutoDubbed: t.kk?.isAutoDubbed || false});
+})()"""
+
+
+def _set_audio_track(track_id):
+    js = f"""(()=>{{
+  const p = document.querySelector('#movie_player');
+  if (!p || typeof p.getAvailableAudioTracks !== 'function') return false;
+  const tracks = p.getAvailableAudioTracks();
+  const t = tracks.find(x => x.id === {json.dumps(track_id)});
+  if (!t) return false;
+  p.setAudioTrack(t);
+  return true;
+}})()"""
+    return _ws_eval(js, user_gesture=True)
+
+
+def cmd_audio(arg):
+    if not _cdp_up():
+        return err("kiosk/CDP not up")
+    raw_tracks = _ws_eval(JS_AUDIO_TRACKS)
+    if not raw_tracks:
+        return err("no audio tracks available (video not playing or no multi-track audio)")
+    tracks = json.loads(raw_tracks)
+
+    if not arg or arg in ("list", "ls", "tracks"):
+        current_raw = _ws_eval(JS_CURRENT_AUDIO)
+        current_id = json.loads(current_raw)["id"] if current_raw else None
+        summary = [{"name": t["name"], "langId": t["langId"],
+                    "isAutoDubbed": t["isAutoDubbed"],
+                    "current": t["id"] == current_id} for t in tracks]
+        return ok("audio_tracks", tracks=summary)
+
+    # Match by: language code ("hi"), partial name ("hindi", "original", "english"), index
+    q = arg.strip().lower()
+    matched = None
+
+    # numeric index
+    if q.isdigit():
+        idx = int(q)
+        if 0 <= idx < len(tracks):
+            matched = tracks[idx]
+        else:
+            return err(f"index {idx} out of range (0–{len(tracks)-1})")
+    else:
+        # "original" shortcut — pick the non-auto-dubbed track
+        if q in ("original", "orig", "source"):
+            matched = next((t for t in tracks if not t["isAutoDubbed"]), None)
+        else:
+            # match lang id prefix or name substring
+            matched = next((t for t in tracks
+                            if q in t["langId"].lower() or q in t["name"].lower()), None)
+
+    if not matched:
+        names = [f"{t['name']} ({t['langId']})" for t in tracks]
+        return err(f"no track matching '{arg}'. Available: {', '.join(names)}")
+
+    ok_flag = _set_audio_track(matched["id"])
+    if not ok_flag:
+        return err(f"setAudioTrack failed for '{matched['name']}'")
+    return ok("audio_switched", track=matched["name"], langId=matched["langId"],
+              isAutoDubbed=matched["isAutoDubbed"])
+
+
 def cmd_display(on):
     conn = hdmi_connector()
     if not conn:
@@ -263,7 +357,70 @@ def cmd_status():
     playing = _ws_eval(JS_PLAYING)
     title = _ws_eval(JS_TITLE)
     conn = hdmi_connector()
-    return ok("status", playing=bool(playing), title=title, hdmi=conn or "disconnected")
+    vol, muted = _wpctl_get_volume()
+    return ok("status", playing=bool(playing), title=title, hdmi=conn or "disconnected",
+              volume=vol, muted=muted)
+
+
+# ── volume (PipeWire / WirePlumber) ──────────────────────────────────────────
+def _wpctl_env():
+    import subprocess as _sp
+    return {**os.environ,
+            "XDG_RUNTIME_DIR": f"/run/user/{UID}",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{UID}/bus"}
+
+
+def _wpctl_get_volume():
+    import subprocess as _sp, re as _re
+    r = _sp.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                env=_wpctl_env(), capture_output=True, text=True)
+    m = _re.search(r"Volume:\s*([\d.]+)(\s*\[MUTED\])?", r.stdout)
+    if not m:
+        return None, None
+    return round(float(m.group(1)), 2), bool(m.group(2))
+
+
+def cmd_volume(arg):
+    import subprocess as _sp
+    arg = arg.strip().lower()
+    if arg in ("get", ""):
+        vol, muted = _wpctl_get_volume()
+        if vol is None:
+            return err("couldn't read volume")
+        pct = round(vol * 100)
+        return ok("volume", volume=vol, percent=pct, muted=muted)
+
+    # relative: +10 / -10 / up / down / louder / quieter
+    rel_map = {"up": "5%+", "louder": "10%+", "down": "5%-", "quieter": "10%-",
+               "mute": None, "unmute": None, "toggle": None}
+    if arg in rel_map:
+        if arg in ("mute", "unmute", "toggle"):
+            flag = {"mute": "1", "unmute": "0", "toggle": "toggle"}[arg]
+            _sp.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", flag],
+                    env=_wpctl_env(), stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            vol, muted = _wpctl_get_volume()
+            return ok("mute", muted=muted, volume=vol)
+        delta = rel_map[arg]
+        _sp.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", delta],
+                env=_wpctl_env(), stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    elif arg.lstrip("+-").rstrip("%").isdigit():
+        # +10 / -10 / 70 / 70%
+        raw = arg.rstrip("%")
+        if raw.startswith("+"):
+            delta = raw.lstrip("+") + "%+"
+        elif raw.startswith("-"):
+            delta = raw.lstrip("-") + "%-"
+        else:
+            val = max(0, min(150, int(raw)))
+            delta = str(val / 100)
+        _sp.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", delta],
+                env=_wpctl_env(), stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    else:
+        return err(f"unknown volume arg: {arg!r} — try: 50, +10, -10, up, down, mute, unmute")
+
+    vol, muted = _wpctl_get_volume()
+    pct = round(vol * 100) if vol is not None else None
+    return ok("volume", volume=vol, percent=pct, muted=muted)
 
 
 # ── output helpers ───────────────────────────────────────────────────────────
@@ -279,7 +436,8 @@ def err(msg):
 
 
 USAGE = ("mediactl.py play|video <query|url> | stop | pause | resume | "
-         "fullscreen | wake | sleep | status")
+         "fullscreen | wake | sleep | status | volume [<n>|+n|-n|up|down|mute|unmute] | "
+         "audio [list|<lang>|original|<index>]")
 
 
 def main(argv):
@@ -305,6 +463,14 @@ def main(argv):
         return cmd_display(False)
     if cmd in ("status", "np"):
         return cmd_status()
+    if cmd in ("volume", "vol", "v"):
+        return cmd_volume(arg)
+    if cmd == "mute":
+        return cmd_volume("mute")
+    if cmd == "unmute":
+        return cmd_volume("unmute")
+    if cmd in ("audio", "track", "lang", "language"):
+        return cmd_audio(arg)
     print(USAGE); return 2
 
 
