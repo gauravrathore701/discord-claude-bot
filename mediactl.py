@@ -16,6 +16,12 @@ Usage:
     mediactl.py fullscreen
     mediactl.py wake  | sleep         # HDMI on / off
     mediactl.py status                # JSON-ish one-line state
+    mediactl.py shows play <query>    # find & play a show/episode from /mnt/hdd
+    mediactl.py shows next <show>     # episode after the last one watched on the monitor
+    mediactl.py shows prev <show>     # previous episode  |  resume <show> = replay last
+    mediactl.py shows search <query>  # list matching shows (no playback)
+    mediactl.py shows open [show]     # open library home, or a show's page
+    mediactl.py shows list            # all shows + episode counts
 
 Design mirrors media.py so behaviour matches the !video / !play bot commands.
 Dependency-free (stdlib only) so it runs from any cwd without a venv.
@@ -40,6 +46,17 @@ CLOCK_URL = os.environ.get(
     "MEDIA_CLOCK_URL",
     "file://" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "flipclock.html"),
 )
+
+# ── shows-app (Cursed Shrine library on /mnt/hdd) ────────────────────────────
+SHOWS_HDD = os.environ.get("SHOWS_HDD_ROOT", "/mnt/hdd")
+SHOWS_SKIP = {"lost+found"}
+SHOWS_VIDEO_EXT = re.compile(r"\.(mp4|mkv|avi|mov|webm)$", re.I)
+SHOWS_LOCAL = os.environ.get("SHOWS_LOCAL_URL", "http://localhost:4178")
+SHOWS_REMOTE = os.environ.get("SHOWS_REMOTE_URL", "https://shows.cursedshrine.com")
+# Per-show last-played pointer (for next/prev/resume). mediactl writes this on every
+# play; also cross-checked against the app's own localStorage['lastWatched'].
+SHOWS_STATE = os.environ.get(
+    "SHOWS_STATE_FILE", os.path.expanduser("~/.cache/mediactl/shows_state.json"))
 
 JS_FIRST_RESULT = """(()=>{
   // Primary: extract from ytInitialData (works even when DOM isn't hydrated)
@@ -423,6 +440,341 @@ def cmd_volume(arg):
     return ok("volume", volume=vol, percent=pct, muted=muted)
 
 
+# ── shows-app: local library browse / search / play ─────────────────────────
+# The shows-app reads /mnt/hdd directly, so mediactl resolves shows and episodes
+# straight off the filesystem (the app has no search endpoint) and deep-links the
+# kiosk to /watch/… . Its AuthGate only checks a JWT in localStorage client-side
+# (no server-side auth on the stream/page routes), so we seed a long-lived kiosk
+# token to pass the gate.
+def _b64url(obj):
+    raw = json.dumps(obj, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _kiosk_token():
+    # header.payload.sig — payload.exp far in the future so AuthGate keeps it.
+    return f'{_b64url({"alg": "none", "typ": "JWT"})}.{_b64url({"sub": "kiosk", "exp": 4102444800})}.kiosk'
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def _shows_base():
+    override = os.environ.get("SHOWS_BASE_URL")
+    if override:
+        return override.rstrip("/")
+    try:  # localhost preferred — on-device, no tunnel latency/chunking
+        with urllib.request.urlopen(SHOWS_LOCAL, timeout=2) as r:
+            if r.status < 500:
+                return SHOWS_LOCAL.rstrip("/")
+    except Exception:
+        pass
+    return SHOWS_REMOTE.rstrip("/")
+
+
+def _list_shows():
+    try:
+        return sorted(d for d in os.listdir(SHOWS_HDD)
+                      if not d.startswith(".") and d not in SHOWS_SKIP
+                      and os.path.isdir(os.path.join(SHOWS_HDD, d)))
+    except OSError:
+        return []
+
+
+def _list_episodes(show):
+    """Flat: [{season:None,file,segs:[file]}]. Seasonal: one entry per file with segs=[season,file]."""
+    base = os.path.join(SHOWS_HDD, show)
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return []
+    direct = sorted(f for f in entries
+                    if SHOWS_VIDEO_EXT.search(f) and os.path.isfile(os.path.join(base, f)))
+    if direct:
+        return [{"season": None, "file": f, "segs": [f]} for f in direct]
+    eps = []
+    for sub in sorted(d for d in entries
+                      if not d.startswith(".") and os.path.isdir(os.path.join(base, d))):
+        try:
+            sfiles = sorted(f for f in os.listdir(os.path.join(base, sub)) if SHOWS_VIDEO_EXT.search(f))
+        except OSError:
+            continue
+        eps += [{"season": sub, "file": f, "segs": [sub, f]} for f in sfiles]
+    return eps
+
+
+def _score_show(show, query):
+    sn, qn = _norm(show), _norm(query)
+    if not sn:
+        return 0
+    if sn == qn:
+        return 1000
+    if qn.startswith(sn):
+        return 500 + len(sn)
+    if sn in qn:
+        return 300 + len(sn)
+    if qn in sn:
+        return 200 + len(qn)
+    overlap = set(sn.split()) & set(qn.split())
+    return 100 * len(overlap)
+
+
+def _resolve_show(query):
+    """Best-matching show + the leftover query text (episode/season hint)."""
+    best, best_score = None, 0
+    for s in _list_shows():
+        sc = _score_show(s, query)
+        if sc > best_score:
+            best, best_score = s, sc
+    if not best:
+        return None, ""
+    sn, qn = _norm(best), _norm(query)
+    if qn.startswith(sn):
+        hint = qn[len(sn):].strip()
+    elif sn in qn:
+        hint = qn.replace(sn, " ").strip()
+    else:
+        st = set(sn.split())
+        hint = " ".join(t for t in qn.split() if t not in st)
+    return best, hint
+
+
+def _match_episode(eps, hint):
+    if not eps:
+        return None
+    if not hint:
+        return eps[0]
+    hl = hint.lower()
+
+    # Season/episode numbers — compact "s05e12" or worded "season 5 episode 12".
+    sn = en = None
+    cm = re.search(r"s\s*(\d+)\s*e\s*(\d+)", hl)
+    if cm:
+        sn, en = int(cm.group(1)), int(cm.group(2))
+    else:
+        sm = re.search(r"season\s*(\d+)", hl)
+        em = re.search(r"(?:episode|ep|\be)\s*(\d+)", hl)
+        if sm:
+            sn = int(sm.group(1))
+        if em:
+            en = int(em.group(1))
+
+    def by_num(pool, n):
+        for e in pool:  # parse the file's own SxxExx
+            fm = re.search(r"s(\d+)\s*e(\d+)", e["file"].lower())
+            if fm and int(fm.group(2)) == n:
+                return e
+        for e in pool:  # explicit marker: E03, ep3, episode 3, x03
+            if re.search(rf"(?:e|ep|episode|x|part)\s*0*{n}\b", e["file"].lower()):
+                return e
+        return None
+
+    if sn is not None:
+        pool = [e for e in eps if e["season"] and re.search(rf"\b0*{sn}\b", _norm(e["season"]))] or eps
+        return (by_num(pool, en) or pool[0]) if en is not None else pool[0]
+
+    if en is not None:
+        hit = by_num(eps, en)
+        if hit:
+            return hit
+
+    nums = re.findall(r"\d+", hl)
+    if nums:
+        n = int(nums[-1])
+        hit = by_num(eps, n)
+        if hit:
+            return hit
+        for e in eps:  # standalone number token
+            if re.search(rf"(?<!\d)0*{n}(?!\d)", re.sub(r"\.\w+$", "", e["file"]).lower()):
+                return e
+    for e in eps:
+        if hl in e["file"].lower():
+            return e
+    for e in eps:
+        if e["season"] and hl in _norm(e["season"]):
+            return e
+    return eps[0]
+
+
+def _watch_path(show, ep):
+    return "/watch/" + "/".join(urllib.parse.quote(p) for p in ([show] + ep["segs"]))
+
+
+def _shows_land(base, wake=True):
+    """Wake screen, land on the origin, and seed the kiosk auth token. Leaves the
+    kiosk on the shows origin so localStorage (auth + lastWatched) is accessible."""
+    if wake:
+        conn = hdmi_connector()
+        if conn:
+            _wlr_randr(conn, True)
+    _navigate(base + "/")
+    _poll(f"location.origin==={json.dumps(base)}?'1':''", total=15, every=0.4)
+    _ws_eval(f"localStorage.setItem('shows_auth', JSON.stringify({{token:{json.dumps(_kiosk_token())}}}))")
+
+
+def _shows_goto(base, pathpart, wake=True):
+    """Land on the origin (seed token), then deep-link to a page."""
+    _shows_land(base, wake)
+    _navigate(base + pathpart)
+
+
+# ── watch history: next / prev / resume ──────────────────────────────────────
+def _state_load():
+    try:
+        with open(SHOWS_STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _state_record(show, ep):
+    state = _state_load()
+    state[show] = {"file": ep["file"], "season": ep["season"], "ts": int(time.time())}
+    try:
+        os.makedirs(os.path.dirname(SHOWS_STATE), exist_ok=True)
+        with open(SHOWS_STATE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def _dom_last_watched():
+    """The app's own localStorage['lastWatched'] (must already be on shows origin)."""
+    raw = _ws_eval("localStorage.getItem('lastWatched')")
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _current_file(show, dom):
+    """Filename of the episode last played for `show` — mediactl's own state first
+    (reliable, timestamped), else the app's lastWatched keyed by <show>[/<season>]."""
+    st = _state_load().get(show)
+    if st and st.get("file"):
+        return st["file"]
+    best = None
+    for k, v in dom.items():  # last matching key wins (rough recency)
+        if k == show or k.startswith(show + "/"):
+            best = v
+    return best
+
+
+def _relative_kw(hint):
+    """+1 next, -1 previous, 0 resume/current, or None if not a relative request."""
+    toks = re.split(r"\W+", hint.lower())
+    if "next" in toks:
+        return 1
+    if "previous" in toks or "prev" in toks:
+        return -1
+    if "resume" in toks or "continue" in toks or "current" in toks:
+        return 0
+    return None
+
+
+def cmd_shows(arg):
+    if not _cdp_up():
+        return err("kiosk/CDP not up — is the discord-claude bot running?")
+    tokens = arg.split()
+    sub = tokens[0].lower() if tokens else "open"
+    rest = " ".join(tokens[1:]).strip()
+
+    if sub in ("list", "ls"):
+        return ok("shows_list", shows=[{"name": s, "episodes": len(_list_episodes(s))}
+                                       for s in _list_shows()])
+    if sub in ("search", "find"):
+        if not rest:
+            return err("shows search needs a query")
+        scored = sorted(((_score_show(s, rest), s) for s in _list_shows()),
+                        key=lambda x: -x[0])
+        matches = []
+        for sc, s in scored:
+            if sc <= 0:
+                break
+            eps = _list_episodes(s)
+            matches.append({"name": s, "episodes": len(eps),
+                            "seasons": sorted({e["season"] for e in eps if e["season"]}) or None})
+        return ok("shows_search", query=rest, matches=matches[:8])
+
+    rel_subs = {"next": 1, "prev": -1, "previous": -1, "resume": 0, "continue": 0}
+    if sub in rel_subs:
+        return _shows_play(rest, rel=rel_subs[sub])
+    if sub in ("play", "watch", "p"):
+        return _shows_play(rest)
+    if sub in ("open", "home", "library", "lib"):
+        return _shows_open(rest or None)
+    return _shows_play(arg.strip())  # bare `shows <query>` == play
+
+
+def _shows_play(query, rel=None):
+    if not query:
+        return _shows_open(None)
+    conn = hdmi_connector()
+    if not conn:
+        return err("no HDMI output detected")
+    show, hint = _resolve_show(query)
+    if not show:
+        return err(f"no show matching: {query}")
+    eps = _list_episodes(show)
+    if not eps:
+        return err(f"'{show}' has no playable videos")
+
+    # A relative word inside the query (e.g. "adventure time next") counts too.
+    if rel is None:
+        rel = _relative_kw(hint)
+
+    base = _shows_base()
+    note = None
+    if rel is not None:
+        _shows_land(base, wake=True)  # on-origin so lastWatched is readable
+        cur_file = _current_file(show, _dom_last_watched())
+        cur = next((i for i, e in enumerate(eps) if e["file"] == cur_file), None)
+        if cur is None:
+            idx, note = 0, "no watch history on the monitor — starting from the first episode"
+        else:
+            idx = cur + rel
+            if idx < 0:
+                idx, note = 0, "already at the first episode"
+            elif idx >= len(eps):
+                idx, note = len(eps) - 1, "already at the last episode — replaying it"
+        ep = eps[idx]
+        _navigate(base + _watch_path(show, ep))
+    else:
+        ep = _match_episode(eps, hint)
+        _shows_goto(base, _watch_path(show, ep), wake=True)
+
+    # HEVC/x265 is transcoded to HLS on demand (cold-seek warmup ~15s on the Pi),
+    # so give it a longer window to confirm playback than a direct browser codec.
+    is_hevc = bool(re.search(r"x265|hevc|h\.?265", ep["file"], re.I))
+    started = _poll(JS_PLAYING, total=50 if is_hevc else 30)
+    if started:
+        time.sleep(1)
+        _ws_eval(JS_FULLSCREEN, user_gesture=True)
+    _state_record(show, ep)
+    if note is None and not started:
+        note = "loaded, playback not confirmed"
+    return ok("shows_play", show=show, season=ep["season"],
+              episode=SHOWS_VIDEO_EXT.sub("", ep["file"]),
+              url=base + _watch_path(show, ep), playing=bool(started), note=note)
+
+
+def _shows_open(query):
+    conn = hdmi_connector()
+    if not conn:
+        return err("no HDMI output detected")
+    base = _shows_base()
+    if query:
+        show, _ = _resolve_show(query)
+        if not show:
+            return err(f"no show matching: {query}")
+        pathpart = "/show/" + urllib.parse.quote(show)
+        _shows_goto(base, pathpart)
+        return ok("shows_open", show=show, url=base + pathpart)
+    _shows_goto(base, "/")
+    return ok("shows_open", url=base + "/", note="library home")
+
+
 # ── output helpers ───────────────────────────────────────────────────────────
 def ok(action, **kw):
     kw = {k: v for k, v in kw.items() if v is not None}
@@ -437,7 +789,9 @@ def err(msg):
 
 USAGE = ("mediactl.py play|video <query|url> | stop | pause | resume | "
          "fullscreen | wake | sleep | status | volume [<n>|+n|-n|up|down|mute|unmute] | "
-         "audio [list|<lang>|original|<index>]")
+         "audio [list|<lang>|original|<index>] | "
+         "shows [play <show [ep/SxxExx]>|next <show>|prev <show>|resume <show>|"
+         "search <q>|open [show]|list]")
 
 
 def main(argv):
@@ -471,6 +825,8 @@ def main(argv):
         return cmd_volume("unmute")
     if cmd in ("audio", "track", "lang", "language"):
         return cmd_audio(arg)
+    if cmd in ("shows", "show", "library", "lib"):
+        return cmd_shows(arg)
     print(USAGE); return 2
 
 
