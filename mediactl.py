@@ -49,9 +49,9 @@ CLOCK_URL = os.environ.get(
 
 # ── shows-app (Cursed Shrine library on /mnt/hdd) ────────────────────────────
 SHOWS_HDD = os.environ.get("SHOWS_HDD_ROOT", "/mnt/hdd")
-SHOWS_SKIP = {"lost+found"}
+SHOWS_SKIP = {"lost+found", "Copy To Pi"}
 SHOWS_VIDEO_EXT = re.compile(r"\.(mp4|mkv|avi|mov|webm)$", re.I)
-SHOWS_LOCAL = os.environ.get("SHOWS_LOCAL_URL", "http://localhost:4178")
+SHOWS_LOCAL = os.environ.get("SHOWS_LOCAL_URL", "http://localhost:4180")
 SHOWS_REMOTE = os.environ.get("SHOWS_REMOTE_URL", "https://shows.cursedshrine.com")
 # Per-show last-played pointer (for next/prev/resume). mediactl writes this on every
 # play; also cross-checked against the app's own localStorage['lastWatched'].
