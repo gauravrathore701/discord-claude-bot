@@ -46,6 +46,9 @@ CDP = f"http://127.0.0.1:{CDP_PORT}"
 PROFILE_DIR = os.path.expanduser("~/.config/chromium-media")
 
 IDLE_TIMEOUT = int(os.environ.get("MEDIA_IDLE_TIMEOUT", str(30 * 60)))  # seconds
+# When false, the idle loop never blanks the HDMI output — monitor stays on
+# (returns to the clock screen instead). Default: keep monitor always on.
+IDLE_BLANK = os.environ.get("MEDIA_IDLE_BLANK", "0") not in ("0", "false", "False", "")
 IDLE_POLL = 60
 WATCH_POLL = 10  # ad-skip / activity watcher interval while media is up
 
@@ -375,7 +378,7 @@ class MediaPlayer:
                 self.title = None
                 self.is_video = False
                 await self._navigate(CLOCK_URL)
-            if self.display_on:
+            if IDLE_BLANK and self.display_on:
                 self.log("[media] idle timeout — blanking HDMI")
                 await self.display(False)
 

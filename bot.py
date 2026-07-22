@@ -475,7 +475,10 @@ async def on_ready():
     print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
     if _rollover_task is None or _rollover_task.done():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
-    asyncio.create_task(MEDIA.startup())   # launch clock screen in background
+    # NOTE: monitor is now manual/desktop-owned. Bot no longer auto-launches the
+    # cage clock kiosk on boot (it raced lightdm for DRM -> black screen). The
+    # physical monitor stays on via LXDE + ~/.config/autostart/monitor-always-on.desktop.
+    # asyncio.create_task(MEDIA.startup())   # DISABLED — no boot-time display grab
     for cid, cfg in CHANNELS.items():
         ch = client.get_channel(cid)
         if ch:
