@@ -11,6 +11,12 @@
     "name": "obsidian",
     "root_dir": "/home/gaurav/Documents/ObsidianVault",
     "project_routing": false,
-    "notes": "This channel is grounded in Gaurav's personal Obsidian vault at /home/gaurav/Documents/ObsidianVault. Treat its notes/files as the primary context for conversation here — read relevant notes before answering, and if asked to jot something down, write it as a note in this vault rather than elsewhere."
+    "notes": [
+      "This channel is grounded in Gaurav's personal Obsidian vault at /home/gaurav/Documents/ObsidianVault. Treat its notes/files as the primary context for conversation here — read relevant notes before answering, and if asked to jot something down, write it as a note in this vault rather than elsewhere.",
+      "AUTO-DOCUMENT EVERYTHING: after answering ANY substantive question in this channel — about a person, a technical topic, a tool, a concept, a place, a product, anything worth remembering — write that answer into the vault as a note, unprompted. Gaurav should never have to ask you to save it.",
+      "AUTO-DOCUMENT — WHERE: put it in the topically closest EXISTING folder. People -> `Mobile/People/<Name>.md`. Technical/study -> `Main/StudyNotesTechnical/`. Claude/LLM/AI -> `Main/AI/`. Shell/Linux -> `Main/LinuxCommands/` or `Main/GeneralUtils/`. Work/day-job -> the matching `Office/` subfolder. Markets/trading -> `Main/ShareMarketStudies/` or `Main/Trading/`. Only create a new folder if nothing fits. Read `/home/gaurav/Documents/ObsidianVault/CLAUDE.md` for the full folder map before deciding.",
+      "AUTO-DOCUMENT — HOW: if a note already covers the subject, APPEND a dated section to it instead of creating a near-duplicate. New notes start with the `Templates/Default.md` header (`**Tags:**`). Write the distilled answer — facts, commands, decisions, why — not the raw chat transcript. Link related notes with `[[wikilinks]]`. Then tell Gaurav which file you wrote or updated, with its path.",
+      "AUTO-DOCUMENT — SKIP: trivia not worth a note — greetings, one-word confirmations, `!`-commands, questions about the bot/monitor/vault plumbing itself, and anything Gaurav explicitly says not to save."
+    ]
   }
 ]

@@ -46,14 +46,24 @@ notes injected into every prompt. Defined as a JSON array in `.claude/channels.j
 ```json
 [
   {"id": "__DEFAULT__", "name": "projects", "root_dir": null, "project_routing": true, "notes": ""},
-  {"id": "1508034882645786644", "name": "obsidian", "root_dir": "/home/gaurav/Documents/ObsidianVault", "project_routing": false, "notes": "..."}
+  {"id": "1508034882645786644", "name": "obsidian", "root_dir": "/home/gaurav/Documents/ObsidianVault",
+   "project_routing": false, "notes": ["...", "..."], "omit": ["history"], "replace_points": false}
 ]
 ```
 
 - `id` — Discord channel ID, or the literal string `"__DEFAULT__"` which resolves to `DISCORD_CHANNEL_ID` from `.env`.
 - `root_dir` — fixed working directory for the channel. `null` means use `PROJECTS_DIR`.
 - `project_routing` — if `true`, a leading `projectname: task` in the message routes into `root_dir/projectname` (falls back to `root_dir` if that subdir doesn't exist). If `false`, every message runs in `root_dir` as-is.
-- `notes` — extra bullet appended to the "IMPORTANT POINTS TO REMEMBER" block for that channel only.
+- `notes` — extra bullets appended to the "IMPORTANT POINTS TO REMEMBER" block for that channel only. Either a single string (one bullet) or a list of strings (one bullet each).
+- `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`, `media`. Default `[]`.
+- `replace_points` — if `true`, all shared base points are skipped and only `notes` are injected. Default `false`.
+
+### The shared points block
+
+`BASE_POINTS` in `bot.py` is an ordered dict of `key -> bullet text`; `build_points_block(cfg)`
+assembles each channel's block as (base points minus `omit`) + `notes`. If a channel ends up
+with zero bullets the header is omitted entirely. `!points` in any channel prints that
+channel's resolved block for verification.
 
 To add a new channel for a new project/folder, add another entry to this file — no code changes needed. Restart the service to pick up changes.
 
@@ -70,4 +80,4 @@ The entire bot is a single file, `bot.py`. It bridges Discord messages to the `c
 5. **Cancellation** — each channel's `ChannelState.active_proc` / `active_task` track its running subprocess and asyncio task so `!cancel` in that channel kills both, without affecting other channels.
 6. **Daily rollover** — `daily_rollover_loop()` fires once per day at 04:45 and rotates/summarizes every configured channel's session independently.
 
-Built-in bot commands (per-channel): `!help`, `!projects`, `!cancel` / `!stop`, `!status`, `!session`, `!newsession`, `model <name>`.
+Built-in bot commands (per-channel): `!help`, `!projects`, `!points`, `!cancel` / `!stop`, `!status`, `!session`, `!newsession`, `model <name>`.

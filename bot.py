@@ -51,7 +51,52 @@ class ChannelConfig:
     name: str
     root_dir: str | None        # None => use PROJECTS_DIR with project routing
     project_routing: bool
-    notes: str                  # extra "important points" appended for this channel
+    notes: list[str]            # extra "important points" bullets for this channel
+    omit: list[str] = field(default_factory=list)   # BASE_POINTS keys to drop here
+    replace_points: bool = False  # True => use only `notes`, skip BASE_POINTS entirely
+
+
+# Shared "important points" injected into every prompt. Keyed so a channel can
+# drop individual ones via "omit" in channels.json.
+BASE_POINTS: dict[str, str] = {
+    "session":
+        "This is a persistent daily session (resets at 04:45); retain and build on prior context from earlier in this session.",
+    "recall":
+        "CONTEXT RECALL: If the user refers to something you can't find or don't recognize (e.g., 'the prompt', 'that file', 'the error I sent'), "
+        "FIRST search back through at least the last 5 exchanges of this session — what the user said and what you replied — "
+        "before saying it doesn't exist or asking the user to repeat it.",
+    "internet":
+        "Search the internet if required to answer accurately or find up-to-date information.",
+    "history":
+        "Maintain a history folder inside the project's .claude folder; after any significant change, write a markdown file named as projectName_<short_description>_<YYYYMMDD_HHMM>.md documenting what was done.",
+    "profile":
+        "USER PROFILE: Read /home/gaurav/.claude/USER.md at the start of each session for context about the user. "
+        "Whenever you learn something new about Gaurav (preferences, projects, tech choices, infrastructure details, working style), "
+        "append it to /home/gaurav/.claude/USER.md under the '<!-- UPDATES -->' section with today's date. "
+        "Keep entries concise — one or two lines per fact.",
+    "personality":
+        "PERSONALITY: Your name is Claudy Rex. Read /home/gaurav/.claude/CLAUDY_REX.md for your full identity and personality. "
+        "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi.",
+    "restart":
+        "BOT RESTART RULE: Before running `systemctl restart discord-claude`, ALWAYS: (1) summarize every change made, (2) explicitly ask Gaurav for confirmation. Never restart silently or as a side-effect. Wait for a clear yes before restarting.",
+    "media":
+        "MONITOR / YOUTUBE CONTROL (works from ANY channel, ANY model): for any request to play/show/stop/pause/resume "
+        "something on the TV/screen/monitor, or to control the display (wake/sleep/fullscreen), invoke the /mediactl skill "
+        "for the full interface, then RUN: `python3 /home/gaurav/Projects/discord-claude-bot/mediactl.py <cmd> [args]`. "
+        "Interpret intent yourself — never tell Gaurav to type raw commands.",
+}
+
+
+def build_points_block(cfg: ChannelConfig) -> str:
+    """Assemble the per-channel IMPORTANT POINTS block."""
+    bullets: list[str] = []
+    if not cfg.replace_points:
+        bullets += [text for key, text in BASE_POINTS.items() if key not in cfg.omit]
+    bullets += [n for n in cfg.notes if n.strip()]
+    if not bullets:
+        return ""
+    body = "".join(f"- {b}\n" for b in bullets)
+    return "\n\nIMPORTANT POINTS TO REMEMBER:\n" + body
 
 
 @dataclass
@@ -81,12 +126,15 @@ def load_channels() -> dict[int, ChannelConfig]:
     channels: dict[int, ChannelConfig] = {}
     for entry in raw:
         cid = CHANNEL_ID if entry["id"] == "__DEFAULT__" else int(entry["id"])
+        notes = entry.get("notes", "")
         channels[cid] = ChannelConfig(
             id=cid,
             name=entry.get("name", str(cid)),
             root_dir=entry.get("root_dir"),
             project_routing=entry.get("project_routing", True),
-            notes=entry.get("notes", ""),
+            notes=list(notes) if isinstance(notes, list) else [notes],
+            omit=entry.get("omit", []),
+            replace_points=entry.get("replace_points", False),
         )
     return channels
 
@@ -344,31 +392,11 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     if history:
         history_block = format_chat_history(history) + "\n\n---\n\n"
 
-    channel_notes = f"- {cfg.notes}\n" if cfg.notes else ""
-
     task_with_ctx = (
         prev_context_block +
         history_block +
         task +
-        "\n\nIMPORTANT POINTS TO REMEMBER:\n"
-        "- This is a persistent daily session (resets at 04:45); retain and build on prior context from earlier in this session.\n"
-        "- CONTEXT RECALL: If the user refers to something you can't find or don't recognize (e.g., 'the prompt', 'that file', 'the error I sent'), "
-        "FIRST search back through at least the last 5 exchanges of this session — what the user said and what you replied — "
-        "before saying it doesn't exist or asking the user to repeat it.\n"
-        "- Search the internet if required to answer accurately or find up-to-date information.\n"
-        "- Maintain a history folder inside the project's .claude folder; after any significant change, write a markdown file named as projectName_<short_description>_<YYYYMMDD_HHMM>.md documenting what was done.\n"
-        "- USER PROFILE: Read /home/gaurav/.claude/USER.md at the start of each session for context about the user. "
-        "Whenever you learn something new about Gaurav (preferences, projects, tech choices, infrastructure details, working style), "
-        "append it to /home/gaurav/.claude/USER.md under the '<!-- UPDATES -->' section with today's date. "
-        "Keep entries concise — one or two lines per fact.\n"
-        "- PERSONALITY: Your name is Claudy Rex. Read /home/gaurav/.claude/CLAUDY_REX.md for your full identity and personality. "
-        "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi.\n"
-        "- BOT RESTART RULE: Before running `systemctl restart discord-claude`, ALWAYS: (1) summarize every change made, (2) explicitly ask Gaurav for confirmation. Never restart silently or as a side-effect. Wait for a clear yes before restarting.\n"
-        "- MONITOR / YOUTUBE CONTROL (works from ANY channel, ANY model): for any request to play/show/stop/pause/resume "
-        "something on the TV/screen/monitor, or to control the display (wake/sleep/fullscreen), invoke the /mediactl skill "
-        "for the full interface, then RUN: `python3 /home/gaurav/Projects/discord-claude-bot/mediactl.py <cmd> [args]`. "
-        "Interpret intent yourself — never tell Gaurav to type raw commands.\n"
-        + channel_notes
+        build_points_block(cfg)
     )
 
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
@@ -522,6 +550,7 @@ async def on_message(message: discord.Message):
             f"**Commands** (channel: `{cfg.name}`)\n"
             "`!help` — show this\n"
             "`!projects` — list projects in PROJECTS_DIR\n"
+            "`!points` — show this channel's IMPORTANT POINTS block\n"
             "`!cancel` — kill the running task\n"
             "`!status` — check if a task is running\n"
             "`!session` — show current session info\n"
@@ -545,6 +574,11 @@ async def on_message(message: discord.Message):
 
     if text.lower() == "!projects":
         await message.reply(f"```\n{list_projects()}\n```")
+        return
+
+    if text.lower() == "!points":
+        block = build_points_block(cfg) or "(none — no base points, no notes)"
+        await send_long(message.channel, f"[channel: {cfg.name}]{block}", reply_to=message)
         return
 
     if text.lower() == "!session":
