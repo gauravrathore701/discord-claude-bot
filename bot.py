@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 import discord
 from dotenv import load_dotenv
 
-from media import MediaPlayer
 
 load_dotenv()
 
@@ -38,9 +37,6 @@ DISCORD_LIMIT = 1900
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
-
-# Single shared media player (one physical monitor/audio output on the Pi).
-MEDIA = MediaPlayer(log=lambda m: print(m, flush=True))
 
 
 # ── multi-channel config ─────────────────────────────────────────────────────
@@ -79,11 +75,6 @@ BASE_POINTS: dict[str, str] = {
         "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi.",
     "restart":
         "BOT RESTART RULE: Before running `systemctl restart discord-claude`, ALWAYS: (1) summarize every change made, (2) explicitly ask Gaurav for confirmation. Never restart silently or as a side-effect. Wait for a clear yes before restarting.",
-    "media":
-        "MONITOR / YOUTUBE CONTROL (works from ANY channel, ANY model): for any request to play/show/stop/pause/resume "
-        "something on the TV/screen/monitor, or to control the display (wake/sleep/fullscreen), invoke the /mediactl skill "
-        "for the full interface, then RUN: `python3 /home/gaurav/Projects/discord-claude-bot/mediactl.py <cmd> [args]`. "
-        "Interpret intent yourself — never tell Gaurav to type raw commands.",
 }
 
 
@@ -503,10 +494,8 @@ async def on_ready():
     print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
     if _rollover_task is None or _rollover_task.done():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
-    # NOTE: monitor is now manual/desktop-owned. Bot no longer auto-launches the
-    # cage clock kiosk on boot (it raced lightdm for DRM -> black screen). The
-    # physical monitor stays on via LXDE + ~/.config/autostart/monitor-always-on.desktop.
-    # asyncio.create_task(MEDIA.startup())   # DISABLED — no boot-time display grab
+    # NOTE: monitor is manual/desktop-owned — LXDE on X11 drives HDMI. No media
+    # control here; the old cage/Chromium kiosk stack was removed 2026-07-31.
     for cid, cfg in CHANNELS.items():
         ch = client.get_channel(cid)
         if ch:
@@ -556,14 +545,6 @@ async def on_message(message: discord.Message):
             "`!session` — show current session info\n"
             "`!newsession` — start a fresh Claude session\n"
             "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n\n"
-            "**Media / monitor** (YouTube in a browser on the Pi's HDMI monitor)\n"
-            "`!play <song or url>` — play (audio focus, doesn't wake the screen)\n"
-            "`!video <query or url>` — play and wake the monitor\n"
-            "`!pause` / `!resume` — pause / resume playback\n"
-            "`!mstop` — stop playback\n"
-            "`!np` — now playing / display status\n"
-            "`!wake` / `!sleep` — turn the HDMI output on / off\n"
-            "_(browser closes + screen blanks after 30 min idle; play/wake restores)_\n\n"
             "**Running a task**\n"
             f"Just type your task. {project_help}"
             "**Sessions**\n"
@@ -634,49 +615,6 @@ async def on_message(message: discord.Message):
     if text.lower() == "!status":
         running = state.active_task and not state.active_task.done()
         await message.reply("A task is running." if running else "Idle.")
-        return
-
-    # ── media / display commands (shared single monitor, run independently) ───
-    low = text.lower()
-    m_play = re.match(r'^!(play|video|playvideo)\s+(.+)$', text, re.IGNORECASE | re.DOTALL)
-    if m_play:
-        video = m_play.group(1).lower() in ("video", "playvideo")
-        query = m_play.group(2).strip()
-        async with message.channel.typing():
-            ok, info = await MEDIA.play(query, video=video)
-        if ok:
-            await message.reply(f"{'📺' if video else '🎵'} Now playing: **{info}**")
-        else:
-            await message.reply(f"⚠️ {info}")
-        return
-
-    if low in ("!mstop", "!stopmusic", "!mediastop"):
-        was = await MEDIA.stop()
-        await message.reply("⏹ Stopped." if was else "Nothing was playing.")
-        return
-
-    if low == "!pause":
-        ok = await MEDIA.pause()
-        await message.reply("⏸ Paused." if ok else "Nothing to pause.")
-        return
-
-    if low == "!resume":
-        ok = await MEDIA.resume()
-        await message.reply("▶ Resumed." if ok else "Nothing to resume.")
-        return
-
-    if low in ("!wake", "!screenon"):
-        ok, msg = await MEDIA.display(True)
-        await message.reply(f"🖥️ {msg}" if ok else f"⚠️ {msg}")
-        return
-
-    if low in ("!sleep", "!screenoff"):
-        ok, msg = await MEDIA.display(False)
-        await message.reply(f"🌙 {msg}" if ok else f"⚠️ {msg}")
-        return
-
-    if low in ("!np", "!nowplaying", "!mstatus"):
-        await message.reply(await MEDIA.status())
         return
 
     # ── reject concurrent tasks (per channel) ────────────────────────────────

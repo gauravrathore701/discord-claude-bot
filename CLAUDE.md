@@ -55,7 +55,7 @@ notes injected into every prompt. Defined as a JSON array in `.claude/channels.j
 - `root_dir` — fixed working directory for the channel. `null` means use `PROJECTS_DIR`.
 - `project_routing` — if `true`, a leading `projectname: task` in the message routes into `root_dir/projectname` (falls back to `root_dir` if that subdir doesn't exist). If `false`, every message runs in `root_dir` as-is.
 - `notes` — extra bullets appended to the "IMPORTANT POINTS TO REMEMBER" block for that channel only. Either a single string (one bullet) or a list of strings (one bullet each).
-- `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`, `media`. Default `[]`.
+- `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`. Default `[]`.
 - `replace_points` — if `true`, all shared base points are skipped and only `notes` are injected. Default `false`.
 
 ### The shared points block
