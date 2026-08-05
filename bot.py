@@ -33,10 +33,50 @@ RESET_MINUTE    = 45
 MODEL_ALIASES = {"sonnet", "opus", "haiku", "fable"}
 
 DISCORD_LIMIT = 1900
+MAX_CHUNKS    = 10     # more than this -> attach as a file (files read badly on a phone,
+                       # so prefer a few extra messages over an upload)
+
+# The /caveman skill, injected as a system prompt on every task so it is really
+# loaded rather than paraphrased in the points block.
+CAVEMAN_SKILL_FILE = os.environ.get(
+    "CAVEMAN_SKILL_FILE", "/home/gaurav/.claude/skills/caveman/SKILL.md")
+CAVEMAN_LEVEL = os.environ.get("CAVEMAN_LEVEL", "ultra")
+
+
+CAVEMAN_LEVELS = ("lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra")
+_caveman_cache: dict[str, str] = {}
+
+
+def caveman_prompt(level: str) -> str:
+    """Skill text (frontmatter stripped) pinned to `level`, for --append-system-prompt.
+    `off` -> empty string, i.e. plain Claude."""
+    level = (level or "off").lower()
+    if level == "off":
+        return ""
+    if level in _caveman_cache:
+        return _caveman_cache[level]
+    try:
+        with open(CAVEMAN_SKILL_FILE) as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"[caveman] skill NOT loaded: {e}", flush=True)
+        _caveman_cache[level] = ""
+        return ""
+    body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.S).strip()
+    prompt = (
+        f"The /caveman skill is ACTIVE for every response, as if invoked with "
+        f"`/caveman {level}`. Its full text follows — follow it.\n\n"
+        f"{body}\n\n"
+        f"Locked intensity: {level.upper()}. Persists across turns; no drift back to "
+        f"normal prose. Only 'stop caveman' / 'normal mode' from the user turns it off."
+    )
+    _caveman_cache[level] = prompt
+    return prompt
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 
 # ── multi-channel config ─────────────────────────────────────────────────────
@@ -75,6 +115,23 @@ BASE_POINTS: dict[str, str] = {
         "Own that name — you are Claudy Rex, Gaurav's engineering AI on the Pi.",
     "restart":
         "BOT RESTART RULE: Before running `systemctl restart discord-claude`, ALWAYS: (1) summarize every change made, (2) explicitly ask Gaurav for confirmation. Never restart silently or as a side-effect. Wait for a clear yes before restarting.",
+    "discord_format":
+        "DISCORD OUTPUT FORMAT — WRITE FOR A PHONE. Gaurav reads these replies on Discord mobile "
+        "(Poco X4 Pro 5G, 6.67\" screen, ~45 monospace characters fit in a code block before it "
+        "scrolls sideways). Format every answer for that narrow column:\n"
+        "- HARD LIMIT: no line inside a ``` code block may exceed 45 characters. Break long commands "
+        "with a trailing \\ and continue on the next line; split long paths/URLs across lines; shorten "
+        "sample output rather than pasting it wide. A wider line is cut off on his screen and he can't read it.\n"
+        "- Never use `|` markdown tables — Discord doesn't render them at all. For 2 columns write "
+        "`label — value` bullet lines. For 3+ columns use a code block with short headers and narrow "
+        "space-aligned columns, still inside 45 chars; if it can't fit, give one short block per row instead.\n"
+        "- Prefer `**bold**` labels over `##` headers (headers eat a lot of vertical space on a phone). "
+        "At most 2-3 sections in an answer.\n"
+        "- Short lines and short paragraphs — 1-2 sentences, then a break. Bullets over prose. "
+        "No deep nesting or indentation.\n"
+        "- Keep the whole answer tight: aim well under 1900 characters. Past that it is split across "
+        "messages, and a very long one is uploaded as answer.md, which is the worst thing to read on a phone.\n"
+        "- Lead with the answer in the first line. Cut preamble, restating of the question, and closing summaries.",
 }
 
 
@@ -99,6 +156,7 @@ class ChannelState:
     prev_session_id: str | None = None
     prev_context_injected: bool = False
     model: str | None = None
+    caveman: str | None = None      # None => CAVEMAN_LEVEL default from .env
     active_proc: asyncio.subprocess.Process | None = None
     active_task: asyncio.Task | None = None
 
@@ -142,6 +200,7 @@ def channel_paths(state: ChannelState) -> dict[str, str]:
     return {
         "session": os.path.join(d, "current.json"),
         "model": os.path.join(d, "model.json"),
+        "caveman": os.path.join(d, "caveman.json"),
         "history": os.path.join(d, "chat_history.json"),
         "summary": os.path.join(d, "prev_summary.json"),
     }
@@ -238,6 +297,64 @@ def save_model(state: ChannelState):
     os.makedirs(state.sessions_dir, exist_ok=True)
     with open(channel_paths(state)["model"], "w") as f:
         json.dump({"model": state.model}, f, indent=2)
+
+
+def load_caveman(state: ChannelState):
+    try:
+        with open(channel_paths(state)["caveman"]) as f:
+            state.caveman = json.load(f).get("caveman")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def save_caveman(state: ChannelState):
+    os.makedirs(state.sessions_dir, exist_ok=True)
+    with open(channel_paths(state)["caveman"], "w") as f:
+        json.dump({"caveman": state.caveman}, f, indent=2)
+
+
+CAVEMAN_CHOICES = (*CAVEMAN_LEVELS, "off", "default")
+
+
+def set_caveman(state: ChannelState, arg: str | None) -> str:
+    """Shared by the `!caveman` text command and the /caveman slash command.
+    No arg -> report the current level. Returns the reply text."""
+    valid = ", ".join(CAVEMAN_CHOICES)
+    if not arg:
+        eff = state.caveman or CAVEMAN_LEVEL
+        src = "channel override" if state.caveman else f"default ({CAVEMAN_LEVEL})"
+        return f"Caveman level: `{eff}` — {src}\nSet with `/caveman <level>`. Valid: {valid}"
+
+    choice = arg.strip().lower()
+    if choice == "default":
+        state.caveman = None
+    elif choice in CAVEMAN_LEVELS or choice == "off":
+        state.caveman = choice
+    else:
+        return f"Unknown level `{arg}`. Valid: {valid}"
+
+    save_caveman(state)
+    eff = state.caveman or CAVEMAN_LEVEL
+    note = " — plain Claude, skill not injected" if eff == "off" else ""
+    return (f"Caveman set to `{state.caveman or 'default'}` (effective: `{eff}`){note}. "
+            f"Applies to the next message, this channel only.")
+
+
+@tree.command(name="caveman", description="Set the caveman skill level for this channel")
+@discord.app_commands.describe(level="Intensity level, or off / default. Omit to show the current one.")
+@discord.app_commands.choices(
+    level=[discord.app_commands.Choice(name=c, value=c) for c in CAVEMAN_CHOICES]
+)
+async def caveman_slash(interaction: discord.Interaction, level: str = ""):
+    cfg = CHANNELS.get(interaction.channel_id)
+    if cfg is None:
+        await interaction.response.send_message(
+            "This channel isn't configured for Claude tasks.", ephemeral=True)
+        return
+    if interaction.user.id not in ALLOWED_IDS:
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"[{cfg.name}] {set_caveman(STATES[cfg.id], level)}")
 
 
 def load_chat_history(state: ChannelState) -> list[dict]:
@@ -391,6 +508,9 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     )
 
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
+    prompt = caveman_prompt(state.caveman or CAVEMAN_LEVEL)
+    if prompt:
+        cmd += ["--append-system-prompt", prompt]
     if state.model:
         cmd += ["--model", state.model]
     if session_active(state):
@@ -455,17 +575,138 @@ async def progress_ping(status_msg: discord.Message, cwd: str):
         pass
 
 
+PHONE_WIDTH = 45   # monospace chars that fit in a Discord code block on Gaurav's phone
+TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
+
+
+def _table_cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _render_table(rows: list[list[str]]) -> list[str]:
+    """Markdown table -> something readable on a phone. Narrow enough: an aligned
+    code block. Too wide: one labelled block per row, so nothing is cut off."""
+    cols = max(len(r) for r in rows)
+    rows = [r + [""] * (cols - len(r)) for r in rows]
+    widths = [max(len(r[i]) for r in rows) for i in range(cols)]
+
+    if sum(widths) + 2 * (cols - 1) <= PHONE_WIDTH:
+        out = ["```"]
+        for n, row in enumerate(rows):
+            out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)).rstrip())
+            if n == 0:
+                out.append("  ".join("-" * w for w in widths))
+        out.append("```")
+        return out
+
+    header, body = rows[0], rows[1:]
+    out: list[str] = []
+    for row in body:
+        label = row[0].strip("*` ")
+        out.append(f"**{label}**" if label else "**—**")
+        for i in range(1, cols):
+            if row[i]:
+                key = header[i].strip("*` ") or f"col{i}"
+                out.append(f"- {key} — {row[i]}")
+        out.append("")
+    return out
+
+
+def demote_tables(text: str) -> str:
+    """Rewrite every markdown pipe table outside code fences. Discord renders none
+    of them, and on a phone a wide one is unreadable even where it does."""
+    lines = text.split("\n")
+    out: list[str] = []
+    fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            out.append(line)
+            i += 1
+            continue
+        is_row = not fence and line.strip().startswith("|") and "|" in line.strip()[1:]
+        if is_row and i + 1 < len(lines) and TABLE_SEP_RE.match(lines[i + 1]) and "|" in lines[i + 1]:
+            rows = [_table_cells(line)]
+            i += 2                                   # header + separator
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(_table_cells(lines[i]))
+                i += 1
+            out.extend(_render_table(rows))
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def split_for_discord(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
+    """Split on line boundaries so Discord still renders the markdown. A ``` code
+    fence left open at a chunk edge is closed and re-opened in the next chunk."""
+    room = limit - 8
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    fence: str | None = None    # the open fence line, e.g. "```json"
+
+    def flush():
+        nonlocal cur, cur_len
+        if not cur:
+            return
+        body = "\n".join(cur)
+        if fence:
+            body += "\n```"
+        if body.strip().strip("`").strip():
+            chunks.append(body)
+        cur = [fence] if fence else []
+        cur_len = (len(fence) + 1) if fence else 0
+
+    for raw in text.split("\n"):
+        # a single line longer than one message still has to be cut somewhere
+        pieces = [raw[i:i + room] for i in range(0, len(raw), room)] or [""]
+        for line in pieces:
+            if cur_len + len(line) + 1 > room:
+                flush()
+            cur.append(line)
+            cur_len += len(line) + 1
+            if line.lstrip().startswith("```"):
+                fence = None if fence else line.lstrip()
+
+    flush()
+    return chunks or [""]
+
+
 async def send_long(channel, text: str, reply_to=None):
-    """Send text, splitting into multiple messages if it exceeds Discord's limit."""
-    chunk_size = DISCORD_LIMIT - 8  # leave room for the ```\n ... \n``` fence
-    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)] or [""]
+    """Post the answer as markdown Discord can render. Too long for a handful of
+    messages -> first chunk inline + the whole thing attached as answer.md."""
+    chunks = split_for_discord(demote_tables(text.strip()) or "(no output)")
+
+    if len(chunks) > MAX_CHUNKS:
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                             encoding="utf-8") as f:
+                f.write(text)
+                path = f.name
+            body = chunks[0] + "\n\n*(answer too long for chat — full text attached)*"
+            file = discord.File(path, filename="answer.md")
+            if reply_to:
+                await reply_to.reply(body, file=file)
+            else:
+                await channel.send(body, file=file)
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        return
 
     for i, chunk in enumerate(chunks):
-        body = f"```\n{chunk}\n```"
         if reply_to and i == 0:
-            await reply_to.reply(body)
+            await reply_to.reply(chunk)
         else:
-            await channel.send(body)
+            await channel.send(chunk)
 
 
 def list_projects() -> str:
@@ -490,8 +731,26 @@ async def on_ready():
     for state in STATES.values():
         load_session(state)
         load_model(state)
+        load_caveman(state)
     print(f"Online as {client.user}", flush=True)
     print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
+    dflt = caveman_prompt(CAVEMAN_LEVEL)
+    print(f"caveman default: {CAVEMAN_LEVEL} ({len(dflt)} chars from {CAVEMAN_SKILL_FILE})"
+          if dflt else f"caveman default: {CAVEMAN_LEVEL} (no skill text loaded)", flush=True)
+    for cid, st in STATES.items():
+        if st.caveman:
+            print(f"  channel {CHANNELS[cid].name}: caveman override -> {st.caveman}", flush=True)
+    # register /caveman per guild — guild syncs are instant, global ones take ~1h
+    guild_ids = {ch.guild.id for cid in CHANNELS
+                 if (ch := client.get_channel(cid)) is not None and getattr(ch, "guild", None)}
+    for gid in guild_ids:
+        try:
+            tree.copy_global_to(guild=discord.Object(id=gid))
+            synced = await tree.sync(guild=discord.Object(id=gid))
+            print(f"slash commands synced to guild {gid}: {[c.name for c in synced]}", flush=True)
+        except discord.HTTPException as e:
+            print(f"slash sync failed for guild {gid}: {e}", flush=True)
+
     if _rollover_task is None or _rollover_task.done():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
     # NOTE: monitor is manual/desktop-owned — LXDE on X11 drives HDMI. No media
@@ -509,7 +768,8 @@ async def on_message(message: discord.Message):
         return
     state = STATES[cfg.id]
 
-    if message.author.bot:
+    # webhook posts (e.g. the zh-ai-support audit log) must never trigger a task
+    if message.author.bot or message.webhook_id:
         return
     if message.author.id not in ALLOWED_IDS:
         await message.reply("Unauthorized.")
@@ -544,7 +804,9 @@ async def on_message(message: discord.Message):
             "`!status` — check if a task is running\n"
             "`!session` — show current session info\n"
             "`!newsession` — start a fresh Claude session\n"
-            "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n\n"
+            "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n"
+            "`/caveman <lite|full|ultra|wenyan-lite|wenyan-full|wenyan-ultra|off|default>` — "
+            "set the caveman skill level for this channel (also `!caveman`, no arg shows current)\n\n"
             "**Running a task**\n"
             f"Just type your task. {project_help}"
             "**Sessions**\n"
@@ -576,6 +838,11 @@ async def on_message(message: discord.Message):
         state.prev_context_injected = False
         save_session(state)
         await message.reply("Session cleared. Next message starts a fresh conversation.")
+        return
+
+    m = re.match(r'^[!/]?caveman(?:\s+(\S+))?$', text, re.IGNORECASE)
+    if m:
+        await message.reply(set_caveman(state, m.group(1)))
         return
 
     m = re.match(r'^!?model(?:\s+(\S+))?$', text, re.IGNORECASE)

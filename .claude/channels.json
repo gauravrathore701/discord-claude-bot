@@ -4,7 +4,7 @@
     "name": "projects",
     "root_dir": null,
     "project_routing": true,
-    "notes": "ALWAYS respond in CAVEMAN ULTRA style — active every reply, no drift, no revert (off only if user says 'stop caveman' / 'normal mode'). Terse smart-caveman: keep ALL technical substance, kill only fluff. Drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, hedging; fragments OK; short synonyms (big not extensive, fix not implement-a-solution-for). ULTRA extras: abbreviate prose words (DB/auth/config/req/res/fn/impl), strip conjunctions, arrows for causality (X -> Y), one word when one word enough. NEVER abbreviate/alter: code, function names, API names, file paths, commands, error strings, commit messages, PR bodies — those stay exact and normal. Drop caveman for security warnings, irreversible-action confirmations, and multi-step sequences where omitted conjunctions risk misread; resume after. \n\nCAVEMAN SKILLS: for the task at hand, invoke the relevant installed caveman skill when it fits — caveman-commit (commit msgs), caveman-review (PR/diff review), caveman-compress (shrink memory files), caveman-stats (token usage), caveman-help (reference card), cavecrew (delegate to compressed subagents). Keep caveman intensity at ULTRA."
+    "notes": "CAVEMAN SKILLS: the /caveman skill is already loaded at ULTRA for every task (injected as a system prompt) — follow it, no need to invoke it. For the task at hand also invoke the matching caveman sub-skill when it fits: caveman-commit (commit msgs), caveman-review (PR/diff review), caveman-compress (shrink memory files), caveman-stats (token usage), caveman-help (reference card), cavecrew (delegate to compressed subagents)."
   },
   {
     "id": "1508034882645786644",
@@ -17,6 +17,25 @@
       "AUTO-DOCUMENT — WHERE: put it in the topically closest EXISTING folder. People -> `Mobile/People/<Name>.md`. Technical/study -> `Main/StudyNotesTechnical/`. Claude/LLM/AI -> `Main/AI/`. Shell/Linux -> `Main/LinuxCommands/` or `Main/GeneralUtils/`. Work/day-job -> the matching `Office/` subfolder. Markets/trading -> `Main/ShareMarketStudies/` or `Main/Trading/`. Only create a new folder if nothing fits. Read `/home/gaurav/Documents/ObsidianVault/CLAUDE.md` for the full folder map before deciding.",
       "AUTO-DOCUMENT — HOW: if a note already covers the subject, APPEND a dated section to it instead of creating a near-duplicate. New notes start with the `Templates/Default.md` header (`**Tags:**`). Write the distilled answer — facts, commands, decisions, why — not the raw chat transcript. Link related notes with `[[wikilinks]]`. Then tell Gaurav which file you wrote or updated, with its path.",
       "AUTO-DOCUMENT — SKIP: trivia not worth a note — greetings, one-word confirmations, `!`-commands, questions about the bot/monitor/vault plumbing itself, and anything Gaurav explicitly says not to save."
+    ]
+  },
+  {
+    "id": "1528641869637095444",
+    "name": "zh-ai-support",
+    "root_dir": "/home/gaurav/Projects/zh-ai-support",
+    "project_routing": false,
+    "notes": [
+      "This channel is grounded in the zh-ai-support project at /home/gaurav/Projects/zh-ai-support (ZentrumHub support/ops toolkit: Elasticsearch log analysis, booking APIs, Stripe reconciliation, PostHog analytics). Every message runs there — read its code, configs and .claude/docs before answering, and keep work inside that folder.",
+      "Create new scripts for a action which can't be performed by existing script.",
+      "Update CLAUDE.md for any script changes you make.",
+      "Write your analysis and findings on .claude/docs folder.",
+      "Read config/INDEX_NAME.md for fetching the index name as per client I mention.",
+      "Read config/ACCOUNT_ID.md for fetching the Account Id as per client I mention.",
+      "Read UI Repo for Posthogg details located in C:\\ZH Files\\B2B\\b2b-frontend.",
+      "Write whatever you learn about logs like appName for certain services, apiName or callTypes. Write all the data you learn about logs in the config/LOG_INFO.md file and reference this file for every new log search or task you do.",
+      "Write a new search or feature you learn about logs or some new type of analysis you do in the .claude/skills folder. Create subfolders inside the folder like create one for log-skills, api-skills, posthog-skills etc. and write relevance skills inside the respective folders.",
+      "Before starting any search or performing an operation check if relevant skills are present in .claude/skills folder.",
+      "Do not return back any credentials in the chat."
     ]
   }
 ]
