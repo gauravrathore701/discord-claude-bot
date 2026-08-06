@@ -35,7 +35,7 @@ Defined in `.env` (see `.env.example`):
 - `DISCORD_ALLOWED_IDS` — comma-separated user IDs allowed to send tasks, shared across all channels (required)
 - `PROJECTS_DIR` — root directory Claude runs tasks from for project-routing channels (default: `/home/gaurav/Projects`)
 - `CLAUDE_BIN` — path to the `claude` CLI binary (default: `/home/gaurav/.local/bin/claude`)
-- `TASK_TIMEOUT` — seconds before a task is killed (default: `600`)
+- `TASK_TIMEOUT` — seconds before a task is killed (default: `600`); a channel can override it with `timeout_minutes` / `timeout` in `channels.json`
 - `CAVEMAN_SKILL_FILE` — path to the `/caveman` SKILL.md injected into every task (default: `/home/gaurav/.claude/skills/caveman/SKILL.md`)
 - `CAVEMAN_LEVEL` — intensity the skill is pinned to (default: `ultra`; `off` disables the injection)
 
@@ -65,6 +65,7 @@ shared base points. Same shape as the obsidian channel — a channel bound to on
 - `notes` — extra bullets appended to the "IMPORTANT POINTS TO REMEMBER" block for that channel only. Either a single string (one bullet) or a list of strings (one bullet each).
 - `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`, `discord_format`. Default `[]`.
 - `replace_points` — if `true`, all shared base points are skipped and only `notes` are injected. Default `false`.
+- `timeout_minutes` / `timeout` — per-channel task timeout. `"timeout_minutes": 25`, `"timeout": 1500` (seconds) and `"timeout": "25m"` / `"90s"` all work; `timeout_minutes` wins if both are set. Omitted -> `TASK_TIMEOUT` from `.env`. `run_claude()` uses `channel_timeout(cfg)`, so a long zh-ai-support log analysis can run 25m while other channels still cap at 10m. `!status` prints the resolved value and whether it came from the channel or the default, and the startup log lists `(id, name, timeout)` per channel.
 
 ### The shared points block
 

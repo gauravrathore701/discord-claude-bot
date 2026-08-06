@@ -90,6 +90,7 @@ class ChannelConfig:
     notes: list[str]            # extra "important points" bullets for this channel
     omit: list[str] = field(default_factory=list)   # BASE_POINTS keys to drop here
     replace_points: bool = False  # True => use only `notes`, skip BASE_POINTS entirely
+    timeout: int | None = None    # per-channel task timeout, seconds; None => TASK_TIMEOUT
 
 
 # Shared "important points" injected into every prompt. Keyed so a channel can
@@ -161,6 +162,32 @@ class ChannelState:
     active_task: asyncio.Task | None = None
 
 
+def parse_timeout(entry: dict) -> int | None:
+    """Per-channel task timeout from a channels.json entry. Accepts
+    "timeout_minutes": 25, "timeout": 1500, or "timeout": "25m" / "90s".
+    Returns seconds, or None to fall back to TASK_TIMEOUT."""
+    if entry.get("timeout_minutes") is not None:
+        return max(1, int(float(entry["timeout_minutes"]) * 60))
+    raw = entry.get("timeout")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip().lower()
+        if raw.endswith("m"):
+            return max(1, int(float(raw[:-1]) * 60))
+        raw = raw[:-1] if raw.endswith("s") else raw
+    return max(1, int(float(raw)))
+
+
+def fmt_secs(secs: int) -> str:
+    m, s = divmod(int(secs), 60)
+    return f"{m}m{s:02d}s" if s else f"{m}m"
+
+
+def channel_timeout(cfg: ChannelConfig) -> int:
+    return cfg.timeout or TIMEOUT
+
+
 def load_channels() -> dict[int, ChannelConfig]:
     """Load channel configs from .claude/channels.json. The entry with
     id "__DEFAULT__" is bound to DISCORD_CHANNEL_ID from .env so the original
@@ -184,6 +211,7 @@ def load_channels() -> dict[int, ChannelConfig]:
             notes=list(notes) if isinstance(notes, list) else [notes],
             omit=entry.get("omit", []),
             replace_points=entry.get("replace_points", False),
+            timeout=parse_timeout(entry),
         )
     return channels
 
@@ -525,12 +553,13 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         env={**os.environ, "TERM": "dumb"},
     )
     state.active_proc = proc
+    limit = channel_timeout(cfg)
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=limit)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
-        return f"Timed out after {TIMEOUT}s."
+        return f"Timed out after {limit}s ({fmt_secs(limit)}, {cfg.name} channel limit)."
     finally:
         state.active_proc = None
 
@@ -733,7 +762,9 @@ async def on_ready():
         load_model(state)
         load_caveman(state)
     print(f"Online as {client.user}", flush=True)
-    print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
+    print(f"Configured channels: "
+          f"{[(cid, cfg.name, fmt_secs(channel_timeout(cfg))) for cid, cfg in CHANNELS.items()]}",
+          flush=True)
     dflt = caveman_prompt(CAVEMAN_LEVEL)
     print(f"caveman default: {CAVEMAN_LEVEL} ({len(dflt)} chars from {CAVEMAN_SKILL_FILE})"
           if dflt else f"caveman default: {CAVEMAN_LEVEL} (no skill text loaded)", flush=True)
@@ -881,7 +912,11 @@ async def on_message(message: discord.Message):
 
     if text.lower() == "!status":
         running = state.active_task and not state.active_task.done()
-        await message.reply("A task is running." if running else "Idle.")
+        limit = channel_timeout(cfg)
+        src = "channel" if cfg.timeout else "default"
+        await message.reply(
+            ("A task is running." if running else "Idle.")
+            + f"\nTimeout: `{fmt_secs(limit)}` ({limit}s, {src})")
         return
 
     # ── reject concurrent tasks (per channel) ────────────────────────────────
