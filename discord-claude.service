@@ -2,6 +2,7 @@
 Description=Discord Claude Code Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -9,8 +10,9 @@ User=gaurav
 WorkingDirectory=/home/gaurav/Projects/discord-claude-bot
 EnvironmentFile=/home/gaurav/Projects/discord-claude-bot/.env
 ExecStart=/home/gaurav/Projects/discord-claude-bot/venv/bin/python bot.py
-Restart=on-failure
-RestartSec=10
+RuntimeDirectory=discord-claude
+Restart=always
+RestartSec=15
 StandardOutput=journal
 StandardError=journal
 

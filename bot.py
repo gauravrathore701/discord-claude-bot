@@ -42,6 +42,11 @@ CAVEMAN_SKILL_FILE = os.environ.get(
     "CAVEMAN_SKILL_FILE", "/home/gaurav/.claude/skills/caveman/SKILL.md")
 CAVEMAN_LEVEL = os.environ.get("CAVEMAN_LEVEL", "ultra")
 
+# Liveness proof for discord-claude-watchdog.timer — see heartbeat_loop().
+HEARTBEAT_FILE = os.environ.get(
+    "HEARTBEAT_FILE", "/run/discord-claude/heartbeat")
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "120"))
+
 
 CAVEMAN_LEVELS = ("lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra")
 _caveman_cache: dict[str, str] = {}
@@ -465,6 +470,22 @@ async def do_daily_rollover(state: ChannelState) -> bool:
     return True
 
 
+async def heartbeat_loop():
+    """Background task: prove the gateway is really alive, not just 'active' to
+    systemd. A dead websocket or dead DNS leaves the process running while the bot
+    shows offline in Discord, so touch HEARTBEAT_FILE only after a real API call
+    succeeds. discord-claude-watchdog.timer restarts the unit if it goes stale."""
+    while True:
+        try:
+            await client.fetch_user(client.user.id)
+            os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception as e:
+            print(f"[heartbeat] check failed: {e}", flush=True)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 async def daily_rollover_loop():
     """Background task: fire do_daily_rollover() for every configured channel once
     per day at RESET_HOUR:RESET_MINUTE. If a channel's task is mid-flight at the
@@ -752,11 +773,12 @@ def list_projects() -> str:
 # ── bot events ────────────────────────────────────────────────────────────────
 
 _rollover_task: asyncio.Task | None = None
+_heartbeat_task: asyncio.Task | None = None
 
 
 @client.event
 async def on_ready():
-    global _rollover_task
+    global _rollover_task, _heartbeat_task
     for state in STATES.values():
         load_session(state)
         load_model(state)
@@ -784,6 +806,8 @@ async def on_ready():
 
     if _rollover_task is None or _rollover_task.done():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
+    if _heartbeat_task is None or _heartbeat_task.done():
+        _heartbeat_task = asyncio.create_task(heartbeat_loop())
     # NOTE: monitor is manual/desktop-owned — LXDE on X11 drives HDMI. No media
     # control here; the old cage/Chromium kiosk stack was removed 2026-07-31.
     for cid, cfg in CHANNELS.items():
