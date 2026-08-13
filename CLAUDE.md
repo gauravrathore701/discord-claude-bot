@@ -38,6 +38,7 @@ Defined in `.env` (see `.env.example`):
 - `TASK_TIMEOUT` — seconds before a task is killed (default: `600`); a channel can override it with `timeout_minutes` / `timeout` in `channels.json`
 - `CAVEMAN_SKILL_FILE` — path to the `/caveman` SKILL.md injected into every task (default: `/home/gaurav/.claude/skills/caveman/SKILL.md`)
 - `CAVEMAN_LEVEL` — intensity the skill is pinned to (default: `ultra`; `off` disables the injection)
+- `ZH_SLACK_WEBHOOK_URL` — Slack incoming-webhook URL that zh-ai-support mirrors webhook-sourced answers to. The URL carries a token, so it lives only here; `channels.json` names the variable (`slack_webhook_env`), never the value.
 
 ## Multi-channel config (`.claude/channels.json`)
 
@@ -65,6 +66,8 @@ shared base points. Same shape as the obsidian channel — a channel bound to on
 - `notes` — extra bullets appended to the "IMPORTANT POINTS TO REMEMBER" block for that channel only. Either a single string (one bullet) or a list of strings (one bullet each).
 - `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`, `discord_format`. Default `[]`.
 - `replace_points` — if `true`, all shared base points are skipped and only `notes` are injected. Default `false`.
+- `slack_webhook_env` — name of the `.env` variable holding a Slack incoming-webhook URL. When set, every **webhook-sourced** answer in this channel is also POSTed to Slack as `{"text": "*Query* …\n\n*Answer* …"}` (query capped at 1500 chars, answer at 2500, both marked `… (truncated)` past that). `relay_to_slack()` never raises — a Slack outage or a 404 is logged to the journal and the Discord answer is unaffected. Messages typed by Gaurav are not relayed.
+- `webhooks` — webhook IDs whose posts in this channel are treated as tasks. A webhook ID is the number in `https://discord.com/api/webhooks/<id>/<token>` (never store the token here). Accepts a single value or a list; the literal `"any"` / `"*"` allows every webhook in that channel. Default: empty, i.e. webhook posts are ignored as before. `zh-ai-support` carries the support webhook so an external system can POST `{"content": "..."}` and get an answer in-channel.
 - `timeout_minutes` / `timeout` — per-channel task timeout. `"timeout_minutes": 25`, `"timeout": 1500` (seconds) and `"timeout": "25m"` / `"90s"` all work; `timeout_minutes` wins if both are set. Omitted -> `TASK_TIMEOUT` from `.env`. `run_claude()` uses `channel_timeout(cfg)`, so a long zh-ai-support log analysis can run 25m while other channels still cap at 10m. `!status` prints the resolved value and whether it came from the channel or the default, and the startup log lists `(id, name, timeout)` per channel.
 
 ### The shared points block
@@ -82,7 +85,7 @@ Per-channel state lives in `.claude/sessions/<channel_id>/` (session id, model o
 
 The entire bot is a single file, `bot.py`. It bridges Discord messages to the `claude` CLI:
 
-1. **Message gating** — `on_message` looks up the channel in `CHANNELS` (built from `channels.json`) and an allowlist of user IDs; unconfigured channels or disallowed users are ignored/rejected.
+1. **Message gating** — `on_message` looks up the channel in `CHANNELS` (built from `channels.json`) and an allowlist of user IDs; unconfigured channels or disallowed users are ignored/rejected. Webhook posts are gated separately by the channel's `webhooks` list: an allowed webhook runs a task (acked with an 👀 reaction and an "Ack — webhook request received" status line, and its prompt is prefixed with a note that the request came from a webhook rather than Gaurav), any other webhook is dropped silently. Webhook callers may ask questions only — `!`/`/` commands and `model`/`caveman <level>` switches are refused, so an unattended caller can't cancel tasks or change the model. The bot's own replies carry no `webhook_id` and are still caught by the `author.bot` check, so there is no reply loop.
 2. **Project routing** — `resolve_dir()` parses the `projectname: task` prefix syntax for channels with `project_routing` enabled. If the named subdirectory exists under the channel's `root_dir`, Claude runs there; otherwise it runs in `root_dir` itself.
 3. **Task execution** — `run_claude()` spawns `claude --dangerously-skip-permissions -p <task>` as an async subprocess with a configurable timeout. `caveman_prompt(level)` reads the `/caveman` SKILL.md (frontmatter stripped, cached per level), wraps it in an "active at `<level>`" preamble, and every task passes the channel's level via `--append-system-prompt` — the real skill, not a paraphrase, on all channels. Only one task runs at a time **per channel**; concurrent requests within the same channel are rejected until the user cancels, but different channels can run tasks simultaneously.
 4. **Output delivery** — written for Discord **mobile** (Gaurav reads on a Poco X4 Pro 5G; `PHONE_WIDTH = 45` monospace chars fit in a code block before it scrolls sideways).

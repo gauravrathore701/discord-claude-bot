@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+import aiohttp
 import discord
 from dotenv import load_dotenv
 
@@ -96,6 +97,9 @@ class ChannelConfig:
     omit: list[str] = field(default_factory=list)   # BASE_POINTS keys to drop here
     replace_points: bool = False  # True => use only `notes`, skip BASE_POINTS entirely
     timeout: int | None = None    # per-channel task timeout, seconds; None => TASK_TIMEOUT
+    webhooks: set[int] = field(default_factory=set)  # webhook ids allowed to task here
+    webhooks_any: bool = False    # True => any webhook in this channel may task
+    slack_webhook: str | None = None  # relay target for webhook-sourced answers
 
 
 # Shared "important points" injected into every prompt. Keyed so a channel can
@@ -208,6 +212,9 @@ def load_channels() -> dict[int, ChannelConfig]:
     for entry in raw:
         cid = CHANNEL_ID if entry["id"] == "__DEFAULT__" else int(entry["id"])
         notes = entry.get("notes", "")
+        hooks = entry.get("webhooks", [])
+        hooks = [hooks] if isinstance(hooks, (str, int)) else list(hooks)
+        hooks_any = any(str(h).lower() in ("any", "*") for h in hooks)
         channels[cid] = ChannelConfig(
             id=cid,
             name=entry.get("name", str(cid)),
@@ -217,6 +224,11 @@ def load_channels() -> dict[int, ChannelConfig]:
             omit=entry.get("omit", []),
             replace_points=entry.get("replace_points", False),
             timeout=parse_timeout(entry),
+            webhooks={int(h) for h in hooks if str(h).isdigit()},
+            webhooks_any=hooks_any,
+            # the Slack URL itself carries a token, so channels.json only names the
+            # .env variable holding it — nothing secret ever lands in the repo
+            slack_webhook=os.environ.get(entry.get("slack_webhook_env", "")) or None,
         )
     return channels
 
@@ -770,6 +782,35 @@ def list_projects() -> str:
         return str(e)
 
 
+SLACK_QUERY_CAP  = 1500   # Slack renders one message; keep the relay readable
+SLACK_ANSWER_CAP = 2500
+
+
+async def relay_to_slack(cfg: ChannelConfig, query: str, answer: str) -> None:
+    """Mirror a webhook-sourced Q&A to the channel's Slack webhook. Never raises —
+    a dead Slack must not affect the Discord answer that was already delivered."""
+    if not cfg.slack_webhook:
+        return
+
+    def clip(s: str, cap: int) -> str:
+        s = s.strip()
+        return s if len(s) <= cap else s[:cap] + "\n… (truncated)"
+
+    body = (f"*Query* (via `{cfg.name}` Discord webhook)\n{clip(query, SLACK_QUERY_CAP)}\n\n"
+            f"*Answer*\n{clip(answer, SLACK_ANSWER_CAP)}")
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(cfg.slack_webhook, json={"text": body}) as resp:
+                if resp.status >= 300:
+                    detail = (await resp.text())[:200]
+                    print(f"slack relay failed ({cfg.name}): {resp.status} {detail}", flush=True)
+                else:
+                    print(f"slack relay ok ({cfg.name})", flush=True)
+    except Exception as e:                                   # noqa: BLE001 — best effort
+        print(f"slack relay error ({cfg.name}): {e}", flush=True)
+
+
 # ── bot events ────────────────────────────────────────────────────────────────
 
 _rollover_task: asyncio.Task | None = None
@@ -823,14 +864,30 @@ async def on_message(message: discord.Message):
         return
     state = STATES[cfg.id]
 
-    # webhook posts (e.g. the zh-ai-support audit log) must never trigger a task
-    if message.author.bot or message.webhook_id:
+    # Webhook posts only run a task when that webhook id is listed in the channel's
+    # "webhooks" (or it is set to "any"). Every other webhook — audit logs, alerts —
+    # still falls through silently, and the bot's own replies never loop back because
+    # they carry no webhook_id and are caught by the author.bot check below.
+    is_webhook = bool(message.webhook_id)
+    if is_webhook:
+        if not (cfg.webhooks_any or message.webhook_id in cfg.webhooks):
+            return
+    elif message.author.bot:
         return
-    if message.author.id not in ALLOWED_IDS:
+    elif message.author.id not in ALLOWED_IDS:
         await message.reply("Unauthorized.")
         return
 
     text = message.content.strip()
+
+    # A webhook is an unattended caller: it may ask questions, never drive the bot's
+    # own controls (!cancel, !newsession, model/caveman switches).
+    if is_webhook and re.match(
+            r'^[!/]|^(model|caveman)\s+'
+            r'(lite|full|ultra|wenyan-\w+|off|default|sonnet|opus|haiku|fable)$',
+            text, re.IGNORECASE):
+        await message.reply("Webhook callers can send questions only, not bot commands.")
+        return
     image_attachments = [
         a for a in message.attachments
         if a.content_type and a.content_type.startswith("image/")
@@ -986,7 +1043,17 @@ async def on_message(message: discord.Message):
         )
         task = f"{task}\n\n{file_note}" if task else f"The user sent a file. Read it and respond:\n{file_note}"
 
-    status = await message.reply(f"Working in `{cwd}`...")
+    if is_webhook:
+        src = message.author.display_name or "webhook"
+        task = (f"[This request arrived through the `{src}` Discord webhook, not typed by Gaurav. "
+                f"Treat it as a support query: answer it in this channel.]\n\n{task}")
+        try:
+            await message.add_reaction("\N{EYES}")
+        except discord.HTTPException:
+            pass
+
+    ack = "Ack — webhook request received. Working in" if is_webhook else "Working in"
+    status = await message.reply(f"{ack} `{cwd}`...")
 
     async def do_task():
         ping = asyncio.create_task(progress_ping(status, cwd))
@@ -999,6 +1066,8 @@ async def on_message(message: discord.Message):
             except discord.NotFound:
                 pass
             await send_long(message.channel, output, reply_to=message)
+            if is_webhook:
+                await relay_to_slack(cfg, text, output)
         except asyncio.CancelledError:
             ping.cancel()
             try:
@@ -1006,6 +1075,8 @@ async def on_message(message: discord.Message):
             except discord.NotFound:
                 pass
             await message.reply("Task was cancelled.")
+            if is_webhook:
+                await relay_to_slack(cfg, text, "(task was cancelled before it finished)")
         finally:
             for p in image_paths:
                 try:
