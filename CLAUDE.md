@@ -38,6 +38,7 @@ Defined in `.env` (see `.env.example`):
 - `TASK_TIMEOUT` — seconds before a task is killed (default: `600`); a channel can override it with `timeout_minutes` / `timeout` in `channels.json`
 - `CAVEMAN_SKILL_FILE` — path to the `/caveman` SKILL.md injected into every task (default: `/home/gaurav/.claude/skills/caveman/SKILL.md`)
 - `CAVEMAN_LEVEL` — intensity the skill is pinned to (default: `ultra`; `off` disables the injection)
+- `STARTUP_CHANNEL_ID` — the one channel that gets the startup announcement (default: `1537133272319008798`). On `on_ready` the bot posts `**Claudy Rex online.**` plus an `ssh gaurav@<ip>` block there, and nowhere else. The IP comes from `lan_ip()` (`ip -4 route get 1.1.1.1`, `src` field) so it is the address reachable from the phone, not a docker bridge. This channel does not need an entry in `channels.json` — it only receives the message; add it there too if it should also accept tasks.
 - `ZH_SLACK_WEBHOOK_URL` — Slack incoming-webhook URL that zh-ai-support mirrors webhook-sourced answers to. The URL carries a token, so it lives only here; `channels.json` names the variable (`slack_webhook_env`), never the value.
 
 ## Multi-channel config (`.claude/channels.json`)

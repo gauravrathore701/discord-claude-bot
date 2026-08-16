@@ -43,6 +43,11 @@ CAVEMAN_SKILL_FILE = os.environ.get(
     "CAVEMAN_SKILL_FILE", "/home/gaurav/.claude/skills/caveman/SKILL.md")
 CAVEMAN_LEVEL = os.environ.get("CAVEMAN_LEVEL", "ultra")
 
+# One startup announcement, in this channel only, instead of one per configured
+# channel. It carries the Pi's current LAN IP because a logged-out Claude account
+# leaves no other way in — without the IP the Pi needs a monitor and keyboard.
+STARTUP_CHANNEL_ID = int(os.environ.get("STARTUP_CHANNEL_ID", "1537133272319008798"))
+
 # Liveness proof for discord-claude-watchdog.timer — see heartbeat_loop().
 HEARTBEAT_FILE = os.environ.get(
     "HEARTBEAT_FILE", "/run/discord-claude/heartbeat")
@@ -811,6 +816,22 @@ async def relay_to_slack(cfg: ChannelConfig, query: str, answer: str) -> None:
         print(f"slack relay error ({cfg.name}): {e}", flush=True)
 
 
+async def lan_ip() -> str:
+    """LAN IP the Pi is reachable at, via the route it would use to reach the
+    internet — `hostname -I` also lists docker bridges and IPv6, which are useless
+    for ssh from the phone. Empty string if the command fails."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip", "-4", "route", "get", "1.1.1.1",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except Exception as e:                                   # noqa: BLE001 — best effort
+        print(f"lan_ip failed: {e}", flush=True)
+        return ""
+    m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", out.decode(errors="replace"))
+    return m.group(1) if m else ""
+
+
 # ── bot events ────────────────────────────────────────────────────────────────
 
 _rollover_task: asyncio.Task | None = None
@@ -851,10 +872,16 @@ async def on_ready():
         _heartbeat_task = asyncio.create_task(heartbeat_loop())
     # NOTE: monitor is manual/desktop-owned — LXDE on X11 drives HDMI. No media
     # control here; the old cage/Chromium kiosk stack was removed 2026-07-31.
-    for cid, cfg in CHANNELS.items():
-        ch = client.get_channel(cid)
-        if ch:
-            await ch.send(f"Claude Code bot is online ({cfg.name}). Send a task or type `!help`.")
+    # Single startup announcement in STARTUP_CHANNEL_ID — the other channels used to
+    # each get their own "bot is online" line, which was three pings for one restart.
+    ch = client.get_channel(STARTUP_CHANNEL_ID)
+    if ch is None:
+        print(f"startup channel {STARTUP_CHANNEL_ID} not visible — no online message",
+              flush=True)
+    else:
+        ip = await lan_ip()
+        ssh = f"```\nssh gaurav@{ip}\n```" if ip else "IP lookup failed — try `raspberrypi.local`."
+        await ch.send(f"**Claudy Rex online.**\n{ssh}")
 
 
 @client.event
