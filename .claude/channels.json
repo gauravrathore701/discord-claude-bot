@@ -37,7 +37,8 @@
       "Write a new search or feature you learn about logs or some new type of analysis you do in the .claude/skills folder. Create subfolders inside the folder like create one for log-skills, api-skills, posthog-skills etc. and write relevance skills inside the respective folders.",
       "Before starting any search or performing an operation check if relevant skills are present in .claude/skills folder.",
       "LOG TIME RANGE DEFAULT: if I don't mention a time window for a log search, search the LAST ONE HOUR only (now-1h to now). Never widen it on your own — if one hour returns nothing or too little, say so and ask before searching a longer range, and always state the exact window you searched in the answer.",
-      "Do not return back any credentials in the chat."
+      "Do not return back any credentials in the chat.",
+      "TIMEZONE — I am in IST (Asia/Kolkata, UTC+05:30). Read every time I give (\"since 3pm\", \"yesterday 10:30\", \"today\") as IST, and report every time back in IST. ES @timestamp is UTC, so convert: pass +05:30 offsets in absolute queries and label output times IST, never raw UTC."
     ],
     "webhooks": [
       "1537137799050956923"
