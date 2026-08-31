@@ -8,13 +8,7 @@
 
 HB=/run/discord-claude/heartbeat
 UNIT=discord-claude.service
-# Bounce whatever wifi profile is actually active. Hardcoding Prestige_5G
-# forced the Pi off a working fallback AP on 2026-08-30 and drove a
-# reboot loop, because brcmfmac cannot associate to a second BSS while
-# still holding the first one.
-WIFI=$(nmcli -t -f TYPE,NAME con show --active \
-        | awk -F: '$1=="802-11-wireless"{print $2; exit}')
-: "${WIFI:=Prestige_5G}"
+WIFI=Prestige_5G
 MAX_STALE=600     # 10m — 5 missed heartbeats
 GRACE=300         # 5m — let a fresh start reach on_ready before judging it
 
