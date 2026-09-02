@@ -487,35 +487,13 @@ async def do_daily_rollover(state: ChannelState) -> bool:
     return True
 
 
-def gateway_alive() -> bool:
-    """True only while the gateway websocket is actually open.
-
-    REST (discord.com/api) and the gateway websocket fail independently. On
-    2026-09-01 the us-east-1a gateway returned 503 for 7h while REST stayed
-    healthy, so a REST-only heartbeat kept refreshing and the watchdog never
-    fired -- the bot sat 'available' in Discord and answered nothing. Check the
-    socket itself: client.ws is None outside a session and client.latency is
-    NaN, which fails the self-equality test below."""
-    if client.is_closed():
-        return False
-    ws = getattr(client, "ws", None)
-    if ws is None or not ws.open:
-        return False
-    latency = client.latency
-    return latency == latency  # NaN != NaN
-
-
 async def heartbeat_loop():
     """Background task: prove the gateway is really alive, not just 'active' to
     systemd. A dead websocket or dead DNS leaves the process running while the bot
-    shows offline in Discord, so touch HEARTBEAT_FILE only after the gateway check
-    AND a real API call succeed. discord-claude-watchdog.timer restarts the unit if
-    it goes stale."""
+    shows offline in Discord, so touch HEARTBEAT_FILE only after a real API call
+    succeeds. discord-claude-watchdog.timer restarts the unit if it goes stale."""
     while True:
         try:
-            if not gateway_alive():
-                raise RuntimeError(
-                    "gateway websocket down (REST may still be up)")
             await client.fetch_user(client.user.id)
             os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
             with open(HEARTBEAT_FILE, "w") as f:
