@@ -13,8 +13,6 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
-import ops  # native Pi ops commands: !usage, !ip, !reboot, !remind
-
 
 load_dotenv()
 
@@ -963,17 +961,6 @@ async def on_message(message: discord.Message):
         return
 
     # ── built-in commands ────────────────────────────────────────────────────
-
-    # Native ops commands run locally — no Claude call, no tokens spent.
-    # !reboot is restricted to the ops channel; the rest work anywhere.
-    if text.lower().split(maxsplit=1)[:1] == ["!reboot"] and cfg.name != "pi-ops":
-        await message.reply("`!reboot` only works in the pi-ops channel.")
-        return
-    ops_reply = ops.handle(text)
-    if ops_reply is not None:
-        await send_long(message.channel, ops_reply, reply_to=message)
-        return
-
     if text.lower() == "!help":
         project_help = (
             "To target a specific project: `projectname: your task here`\n\n"
