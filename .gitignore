@@ -11,3 +11,10 @@ secrets.*
 *.key
 *.pem
 discord-claude.service
+
+# Local pre-edit backups — never publish
+backups/
+*.bak
+*.bak-*
+*.bak.*
+*.bak2-*
