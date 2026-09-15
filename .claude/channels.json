@@ -15,7 +15,7 @@
       "ANSWER FIRST, ALWAYS. The reply in Discord is the deliverable; the vault note is a side-effect. Never reply with only \"Note written\", \"Logged\", a file path, or a status line. Every reply must contain the FULL answer to what Gaurav asked — verdict, facts, reasoning, numbers — written out in the message itself, even when you also saved it to the vault. Mention the note path at the very END, as one short line, after the answer. If the answer is long, still answer in the message (trim to the phone format), never redirect him to the file.",
       "This channel is grounded in Gaurav's personal Obsidian vault at /home/gaurav/Documents/ObsidianVault. Treat its notes/files as the primary context for conversation here — read relevant notes before answering, and if asked to jot something down, write it as a note in this vault rather than elsewhere.",
       "AUTO-DOCUMENT EVERYTHING: after answering ANY substantive question in this channel — about a person, a technical topic, a tool, a concept, a place, a product, anything worth remembering — write that answer into the vault as a note, unprompted. Gaurav should never have to ask you to save it.",
-      "AUTO-DOCUMENT — WHERE: put it in the topically closest EXISTING folder. People -> `Mobile/People/<Name>.md`. Technical/study -> `Main/StudyNotesTechnical/`. Claude/LLM/AI -> `Main/AI/`. Shell/Linux -> `Main/LinuxCommands/` or `Main/GeneralUtils/`. Work/day-job -> the matching `Office/` subfolder. Markets/trading -> `Main/ShareMarketStudies/` or `Main/Trading/`. Only create a new folder if nothing fits. Read `/home/gaurav/Documents/ObsidianVault/CLAUDE.md` for the full folder map before deciding.",
+      "AUTO-DOCUMENT — WHERE: put it in the topically closest EXISTING folder. People -> `Mobile/People/<Name>.md`. Technical/study -> `Main/StudyNotesTechnical/`. Claude/LLM/AI -> `Main/AI/`. Shell/Linux -> `Main/LinuxCommands/` or `Main/GeneralUtils/`. Work/day-job -> the matching `Office/` subfolder. Money/investing/trading/credit cards/tax -> `Finance/`. Only create a new folder if nothing fits. Read `/home/gaurav/Documents/ObsidianVault/CLAUDE.md` for the full folder map before deciding.",
       "AUTO-DOCUMENT — HOW: if a note already covers the subject, APPEND a dated section to it instead of creating a near-duplicate. New notes start with the `Templates/Default.md` header (`**Tags:**`). Write the distilled answer — facts, commands, decisions, why — not the raw chat transcript. Link related notes with `[[wikilinks]]`. Then tell Gaurav which file you wrote or updated, with its path.",
       "AUTO-DOCUMENT — SKIP: trivia not worth a note — greetings, one-word confirmations, `!`-commands, questions about the bot/monitor/vault plumbing itself, and anything Gaurav explicitly says not to save."
     ]
@@ -76,6 +76,39 @@
       "REMINDERS: `!remind <when> | <message>` handles fixed times (`HH:MM` daily, `YYYY-MM-DD HH:MM`, `today/tomorrow HH:MM`, `+2h`, `+30m`) with no AI. Only fuzzy timing (\"before the match starts\", \"every other Tuesday\") should reach you. In that case work out the exact time yourself, append the correctly formatted line to /home/gaurav/Projects/daily-script/reminder/reminders.txt, and reply with the exact line you wrote.",
       "REBOOT: `!reboot` is native, two-step, and detached via systemd-run. Never run `systemctl reboot`, `shutdown` or `systemctl restart` yourself in this channel — a direct call would kill the bot mid-reply because it runs inside its own cgroup.",
       "DESTRUCTIVE ACTIONS still need Gaurav's explicit yes, exactly as in every other channel. An ops channel is not a licence to skip the deletion rule."
+    ]
+  },
+  {
+    "id": "1549071536592265266",
+    "name": "finance",
+    "root_dir": "/home/gaurav/Documents/ObsidianVault/Finance",
+    "project_routing": false,
+    "timeout_minutes": 25,
+    "omit": [
+      "history"
+    ],
+    "notes": [
+      "ANSWER FIRST, ALWAYS. The reply in Discord is the deliverable; the vault note is a side-effect. Never reply with only \"Note written\", \"Logged\" or a file path. Every reply carries the full answer — verdict, numbers, math, reasoning — written out in the message (trimmed to the phone format). Mention the note path at the very END in one short line.",
+      "FINANCE CHANNEL (#rex-finance). Grounded in Gaurav's personal money notes at /home/gaurav/Documents/ObsidianVault/Finance. Read `Finance/CLAUDE.md` (and the vault's root `CLAUDE.md`) before answering — it maps the subfolders (CreditCards, MutualFunds, StocksAndTrading, SavingsAndDeposits, PassiveIncome) and holds the standing rules. Always read the relevant note before answering and build on the recorded holdings, decisions and rules; don't restart from generic advice.",
+      "FRESH NUMBERS ONLY. Rates, NAVs, prices, tax slabs, RBI/SEBI/DICGC limits and bank offers change — verify anything time-sensitive on the web and cite the source with its date. Never present a remembered rate or return as current. For gold / NiftyBees / GoldBees / market status run `/home/gaurav/Projects/daily-script/gold_price.py` and show its output. Show the math for any projection and label assumptions. These are research notes, not SEBI-registered advice — say so when recommending a product.",
+      "AUTO-DOCUMENT: after answering any substantive money question, save the distilled answer into Finance/ unprompted. If a note already covers it, APPEND a dated section (`## YYYY-MM-DD — <what>`); otherwise create a new note in the matching subfolder with the `**Tags:**` header, end research with `## Sources`, and link related notes with [[wikilinks]]. New CamelCase subfolder only if nothing fits; never leave notes loose in the Finance/ root. Log wrong earlier statements under the note's \"Corrections logged\" — never silently rewrite old numbers. SKIP greetings, one-word confirmations and questions about the bot itself.",
+      "SCOPE: stay inside Finance/ for writes. Read-only elsewhere in the vault when context helps (e.g. `Main/Career/` for salary numbers). Never write to `Office/` (it syncs to the office laptop) and never move finance notes there.",
+      "SENSITIVE DATA: never store full card numbers, CVV, UPI PIN, OTPs, net-banking passwords, PAN/Aadhaar or full account numbers — last 4 card digits at most. If Gaurav pastes one, use it for the answer but mask it in the note. Nothing from this channel goes to the blog, feed channels or any public repo.",
+      "HISTORY: after a significant change (new note, restructure, big update) write `/home/gaurav/Documents/ObsidianVault/.claude/history/ObsidianVault_<short-description>_<YYYYMMDD_HHMM>.md` — the vault-level history folder, NOT a Finance/.claude folder."
+    ]
+  },
+  {
+    "id": "1549074815783014551",
+    "name": "animation",
+    "root_dir": "/home/gaurav/Projects/Animations",
+    "project_routing": false,
+    "timeout_minutes": 30,
+    "notes": [
+      "ANIMATION CHANNEL (#rex-animation). Blender modelling/animation on the Pi via the `blender` MCP server. Read `/home/gaurav/Projects/Animations/CLAUDE.md` first every task — it has the Pi/Blender setup, workflow and layout. Check `.claude/skills/` for an existing skill before working something out from scratch, and follow it.",
+      "START BLENDER FIRST: before any mcp__blender__ call, check `ss -ltn | grep ':9876 '`; if down run `/home/gaurav/Projects/.claude/tools/blender-mcp/start-blender.sh` (skill: blender-session). Cycles CPU with use_denoising=False is the default engine; never render long jobs through MCP — save the .blend and render headless (skill: blender-render-publish), detached via `systemd-run --user` when over ~5 min.",
+      "KEEP CREATING SKILLS: whenever a task teaches something reusable (technique, rig/material/lighting recipe, asset import flow, render/encode recipe, Pi or MCP gotcha), add or update `.claude/skills/<kebab-name>/SKILL.md` BEFORE ending the task, unprompted, using the format in CLAUDE.md. Only record steps that actually worked on this Pi. Update an existing skill instead of duplicating. End the reply with one line naming the skill(s) added/updated.",
+      "SHOW RESULTS: each deliverable (mp4/gif/still) goes to `/home/gaurav/Projects/share-over-the-internet/blender/<name>/` and the reply includes `http://192.168.1.15:4185/blender/<name>/` (LAN/Tailscale only). Before a long render, render a small preview and give Gaurav the time estimate.",
+      "LOCAL ONLY: this folder is in `~/routines/git_sync_skip.txt` — never `git init` or push it. Work files live in `projects/<name>/`; delete the PNG frame sequence after the mp4 is verified (temp output). Deleting a .blend or a published render, or killing a Blender with possibly unsaved work, needs Gaurav's yes."
     ]
   }
 ]
