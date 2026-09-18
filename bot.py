@@ -14,6 +14,8 @@ import discord
 from dotenv import load_dotenv
 
 import ops  # native Pi ops commands: !usage, !ip, !reboot, !remind
+import checklist  # tap-to-tick button lists: daily tasks + ```checklist blocks
+import skills     # per-channel skills index: shared ~/.claude/skills + project .claude/skills
 
 
 load_dotenv()
@@ -30,8 +32,10 @@ BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_ROOT   = os.path.join(BASE_DIR, ".claude", "sessions")
 CHANNELS_FILE   = os.path.join(BASE_DIR, ".claude", "channels.json")
 CHAT_HISTORY_MAX  = 5
-RESET_HOUR      = 4
-RESET_MINUTE    = 45
+# 06:30, not 04:45: the rollover summaries call Claude, and a call inside 02:30-06:30
+# opens an off-grid 5h window (see ~/routines/claude_window/window_ping.py).
+RESET_HOUR      = 6
+RESET_MINUTE    = 30
 
 MODEL_ALIASES = {"sonnet", "opus", "haiku", "fable"}
 
@@ -90,6 +94,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
+checklist.setup(client, ALLOWED_IDS)
 
 
 # ── multi-channel config ─────────────────────────────────────────────────────
@@ -113,7 +118,7 @@ class ChannelConfig:
 # drop individual ones via "omit" in channels.json.
 BASE_POINTS: dict[str, str] = {
     "session":
-        "This is a persistent daily session (resets at 04:45); retain and build on prior context from earlier in this session.",
+        "This is a persistent daily session (resets at 06:30); retain and build on prior context from earlier in this session.",
     "recall":
         "CONTEXT RECALL: If the user refers to something you can't find or don't recognize (e.g., 'the prompt', 'that file', 'the error I sent'), "
         "FIRST search back through at least the last 5 exchanges of this session — what the user said and what you replied — "
@@ -160,11 +165,21 @@ BASE_POINTS: dict[str, str] = {
         "- Keep the whole answer tight: aim well under 1900 characters. Past that it is split across "
         "messages, and a very long one is uploaded as answer.md, which is the worst thing to read on a phone.\n"
         "- Lead with the answer in the first line. Cut preamble, restating of the question, and closing summaries.",
+    "skills":
+        "SKILLS: the SKILLS INDEX at the end of this block lists every skill this channel can use — "
+        "shared ones in `~/.claude/skills/` (all channels) and this project's `.claude/skills/`. "
+        "Before starting a task, check it; when one matches, read that file and follow it instead of "
+        "working it out from scratch (e.g. `discord-checklist` for anything tickable: todos, task lists, "
+        "checklists). When you work out a reusable how-to, save it as a skill with frontmatter `name` + "
+        "`description` (what it does + when to use it): useful in every channel -> "
+        "`~/.claude/skills/<kebab-name>/SKILL.md`, project-only -> that project's `.claude/skills/`. "
+        "Gaurav can type `!skills` to see the list.",
 }
 
 
-def build_points_block(cfg: ChannelConfig) -> str:
-    """Assemble the per-channel IMPORTANT POINTS block."""
+def build_points_block(cfg: ChannelConfig, cwd: str | None = None) -> str:
+    """Assemble the per-channel IMPORTANT POINTS block, plus the skills index for
+    `cwd` when the channel keeps the `skills` point."""
     bullets: list[str] = []
     if not cfg.replace_points:
         bullets += [text for key, text in BASE_POINTS.items() if key not in cfg.omit]
@@ -172,7 +187,10 @@ def build_points_block(cfg: ChannelConfig) -> str:
     if not bullets:
         return ""
     body = "".join(f"- {b}\n" for b in bullets)
-    return "\n\nIMPORTANT POINTS TO REMEMBER:\n" + body
+    index = ""
+    if not cfg.replace_points and "skills" not in cfg.omit:
+        index = skills.index_block(cwd or cfg.root_dir or PROJECTS_DIR)
+    return "\n\nIMPORTANT POINTS TO REMEMBER:\n" + body + index
 
 
 @dataclass
@@ -270,7 +288,7 @@ def channel_paths(state: ChannelState) -> dict[str, str]:
 
 
 def get_cycle_start() -> float:
-    """Timestamp of the most recent 4:45 AM daily reset."""
+    """Timestamp of the most recent 06:30 daily reset."""
     now = datetime.now()
     cutoff = now.replace(hour=RESET_HOUR, minute=RESET_MINUTE, second=0, microsecond=0)
     if now < cutoff:
@@ -300,7 +318,7 @@ def session_age_str(state: ChannelState) -> str:
     return (
         f"ID: `{state.session_id[:8]}…`\n"
         f"Age: {h}h {m % 60}m\n"
-        f"Resets in: {th}h {tm % 60}m (daily at 04:45)"
+        f"Resets in: {th}h {tm % 60}m (daily at 06:30)"
     )
 
 
@@ -582,7 +600,7 @@ def resolve_dir(cfg: ChannelConfig, content: str) -> tuple[str, str]:
 
 async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: str) -> str:
     # Bridge previous day context into the first message of a new session.
-    # Normally daily_rollover_loop() already generated this at 04:45; fall back to a
+    # Normally daily_rollover_loop() already generated this at 06:30; fall back to a
     # lazy fetch here only if the bot was offline at rollover time and it never ran.
     prev_context_block = ""
     if not session_active(state) and state.prev_session_id and not state.prev_context_injected:
@@ -605,7 +623,7 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         prev_context_block +
         history_block +
         task +
-        build_points_block(cfg)
+        build_points_block(cfg, cwd)
     )
 
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
@@ -871,11 +889,12 @@ async def lan_ip() -> str:
 
 _rollover_task: asyncio.Task | None = None
 _heartbeat_task: asyncio.Task | None = None
+_checklist_tasks: list[asyncio.Task] = []
 
 
 @client.event
 async def on_ready():
-    global _rollover_task, _heartbeat_task
+    global _rollover_task, _heartbeat_task, _checklist_tasks
     for state in STATES.values():
         load_session(state)
         load_model(state)
@@ -905,6 +924,11 @@ async def on_ready():
         _rollover_task = asyncio.create_task(daily_rollover_loop())
     if _heartbeat_task is None or _heartbeat_task.done():
         _heartbeat_task = asyncio.create_task(heartbeat_loop())
+    if not _checklist_tasks or any(t.done() for t in _checklist_tasks):
+        for t in _checklist_tasks:
+            t.cancel()
+        _checklist_tasks = [asyncio.create_task(checklist.watch_loop()),
+                            asyncio.create_task(checklist.daily_loop())]
     # NOTE: monitor is manual/desktop-owned — LXDE on X11 drives HDMI. No media
     # control here; the old cage/Chromium kiosk stack was removed 2026-07-31.
     # Single startup announcement in STARTUP_CHANNEL_ID — the other channels used to
@@ -973,6 +997,8 @@ async def on_message(message: discord.Message):
     if ops_reply is not None:
         await send_long(message.channel, ops_reply, reply_to=message)
         return
+    if not is_webhook and await checklist.handle(message, text):
+        return
 
     if text.lower() == "!help":
         project_help = (
@@ -989,6 +1015,8 @@ async def on_message(message: discord.Message):
             "`!status` — check if a task is running\n"
             "`!session` — show current session info\n"
             "`!newsession` — start a fresh Claude session\n"
+            "`!skills` — list skills this channel can use (`!skills <project>` in the projects channel)\n"
+            "`!tasks` — post today's task list (`!task add <text>`, `!task rm <n>`)\n"
             "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n"
             "`/caveman <lite|full|ultra|wenyan-lite|wenyan-full|wenyan-ultra|off|default>` — "
             "set the caveman skill level for this channel (also `!caveman`, no arg shows current)\n\n"
@@ -996,12 +1024,17 @@ async def on_message(message: discord.Message):
             f"Just type your task. {project_help}"
             "**Sessions**\n"
             "Claude remembers context within each day, per channel. "
-            "Sessions reset automatically at 04:45 every morning, or use `!newsession`."
+            "Sessions reset automatically at 06:30 every morning, or use `!newsession`."
         )
         return
 
     if text.lower() == "!projects":
         await message.reply(f"```\n{list_projects()}\n```")
+        return
+
+    if text.lower() == "!skills" or text.lower().startswith("!skills "):
+        cwd, _ = resolve_dir(cfg, text[len("!skills"):].strip() + ": x")
+        await send_long(message.channel, skills.list_text(cwd), reply_to=message)
         return
 
     if text.lower() == "!points":
@@ -1138,7 +1171,10 @@ async def on_message(message: discord.Message):
                 await status.delete()
             except discord.NotFound:
                 pass
-            await send_long(message.channel, output, reply_to=message)
+            shown, lists = checklist.extract_blocks(output)
+            await send_long(message.channel, shown or "(checklist below)", reply_to=message)
+            for title, items in lists:
+                await checklist.post(message.channel, checklist.new_adhoc(title, items))
             if is_webhook:
                 await relay_to_slack(cfg, text, output)
         except asyncio.CancelledError:

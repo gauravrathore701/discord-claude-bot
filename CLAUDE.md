@@ -39,6 +39,10 @@ Defined in `.env` (see `.env.example`):
 - `CAVEMAN_SKILL_FILE` — path to the `/caveman` SKILL.md injected into every task (default: `/home/gaurav/.claude/skills/caveman/SKILL.md`)
 - `CAVEMAN_LEVEL` — intensity the skill is pinned to (default: `ultra`; `off` disables the injection)
 - `STARTUP_CHANNEL_ID` — the one channel that gets the startup announcement (default: `1537133272319008798`). On `on_ready` the bot posts `**Claudy Rex online.**` plus an `ssh gaurav@<ip>` block there, and nowhere else. The IP comes from `lan_ip()` (`ip -4 route get 1.1.1.1`, `src` field) so it is the address reachable from the phone, not a docker bridge. This channel does not need an entry in `channels.json` — it only receives the message; add it there too if it should also accept tasks.
+- `TASKS_CHANNEL_ID` — channel the daily task list is posted to (default: `1508034882645786644`, #rex-chat)
+- `TASKS_POST_TIME` — `HH:MM` local time the daily task list is posted (default: `07:00`)
+- `TASKS_DIR` — Obsidian daily-notes folder holding the task lists (default: `<vault>/DailyNotes`; vault from `OBSIDIAN_VAULT`, default `/home/gaurav/Documents/ObsidianVault`)
+- `SHARED_SKILLS_DIR` — shared skills folder indexed for every channel (default: `~/.claude/skills`)
 - `ZH_SLACK_WEBHOOK_URL` — Slack incoming-webhook URL that zh-ai-support mirrors webhook-sourced answers to. The URL carries a token, so it lives only here; `channels.json` names the variable (`slack_webhook_env`), never the value.
 
 ## Multi-channel config (`.claude/channels.json`)
@@ -65,7 +69,7 @@ shared base points. Same shape as the obsidian channel — a channel bound to on
 - `root_dir` — fixed working directory for the channel. `null` means use `PROJECTS_DIR`.
 - `project_routing` — if `true`, a leading `projectname: task` in the message routes into `root_dir/projectname` (falls back to `root_dir` if that subdir doesn't exist). If `false`, every message runs in `root_dir` as-is.
 - `notes` — extra bullets appended to the "IMPORTANT POINTS TO REMEMBER" block for that channel only. Either a single string (one bullet) or a list of strings (one bullet each).
-- `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`, `discord_format`. Default `[]`.
+- `omit` — list of `BASE_POINTS` keys to drop for this channel. Valid keys: `session`, `recall`, `internet`, `history`, `profile`, `personality`, `restart`, `delete`, `discord_format`, `skills` (also drops the skills index). Default `[]`.
 - `replace_points` — if `true`, all shared base points are skipped and only `notes` are injected. Default `false`.
 - `slack_webhook_env` — name of the `.env` variable holding a Slack incoming-webhook URL. When set, every **webhook-sourced** answer in this channel is also POSTed to Slack as `{"text": "*Query* …\n\n*Answer* …"}` (query capped at 1500 chars, answer at 2500, both marked `… (truncated)` past that). `relay_to_slack()` never raises — a Slack outage or a 404 is logged to the journal and the Discord answer is unaffected. Messages typed by Gaurav are not relayed.
 - `webhooks` — webhook IDs whose posts in this channel are treated as tasks. A webhook ID is the number in `https://discord.com/api/webhooks/<id>/<token>` (never store the token here). Accepts a single value or a list; the literal `"any"` / `"*"` allows every webhook in that channel. Default: empty, i.e. webhook posts are ignored as before. `zh-ai-support` carries the support webhook so an external system can POST `{"content": "..."}` and get an answer in-channel.
@@ -84,7 +88,7 @@ Per-channel state lives in `.claude/sessions/<channel_id>/` (session id, model o
 
 ## Architecture
 
-The entire bot is a single file, `bot.py`. It bridges Discord messages to the `claude` CLI:
+The bot is `bot.py`, plus `ops.py` (native `!` ops commands), `checklist.py` (button checklists) and `skills.py` (skills index), both described below. It bridges Discord messages to the `claude` CLI:
 
 1. **Message gating** — `on_message` looks up the channel in `CHANNELS` (built from `channels.json`) and an allowlist of user IDs; unconfigured channels or disallowed users are ignored/rejected. Webhook posts are gated separately by the channel's `webhooks` list: an allowed webhook runs a task (acked with an 👀 reaction and an "Ack — webhook request received" status line, and its prompt is prefixed with a note that the request came from a webhook rather than Gaurav), any other webhook is dropped silently. Webhook callers may ask questions only — `!`/`/` commands and `model`/`caveman <level>` switches are refused, so an unattended caller can't cancel tasks or change the model. The bot's own replies carry no `webhook_id` and are still caught by the `author.bot` check, so there is no reply loop.
 2. **Project routing** — `resolve_dir()` parses the `projectname: task` prefix syntax for channels with `project_routing` enabled. If the named subdirectory exists under the channel's `root_dir`, Claude runs there; otherwise it runs in `root_dir` itself.
@@ -95,9 +99,9 @@ The entire bot is a single file, `bot.py`. It bridges Discord messages to the `c
    - `send_long()` posts the chunks as plain markdown. More than `MAX_CHUNKS` (10) chunks -> first chunk inline plus the full text as `answer.md`; the limit is deliberately high because file attachments read badly on a phone.
    - The `discord_format` base point tells Claude to write for the same target: 45-char cap inside code blocks, no `|` tables, `**bold**` labels over `##` headers, short lines, well under 1900 chars.
 5. **Cancellation** — each channel's `ChannelState.active_proc` / `active_task` track its running subprocess and asyncio task so `!cancel` in that channel kills both, without affecting other channels.
-6. **Daily rollover** — `daily_rollover_loop()` fires once per day at 04:45 and rotates/summarizes every configured channel's session independently.
+6. **Daily rollover** — `daily_rollover_loop()` fires once per day at 06:30 (moved from 04:45 on 2026-09-17 so its Claude calls land in the 06:30 usage window) and rotates/summarizes every configured channel's session independently.
 
-Built-in bot commands (per-channel): `!help`, `!projects`, `!points`, `!cancel` / `!stop`, `!status`, `!session`, `!newsession`, `model <name>`, `/caveman <level>`.
+Built-in bot commands (per-channel): `!help`, `!projects`, `!points`, `!cancel` / `!stop`, `!status`, `!session`, `!newsession`, `!skills [project]`, `!tasks` / `!task add <text>` / `!task rm <n>`, `model <name>`, `/caveman <level>`.
 
 ## Caveman level
 
@@ -112,3 +116,46 @@ the text handler; all three call the same `set_caveman()`. Valid levels:
 `lite`, `full`, `ultra`, `wenyan-lite`, `wenyan-full`, `wenyan-ultra`, plus `off` (no skill
 injected at all) and `default` (fall back to `CAVEMAN_LEVEL`). No argument prints the current
 level and where it came from.
+
+## Interactive checklists (`checklist.py`)
+
+A message with one tap-to-tick button per item (✅ green / ⬜ grey). The source of truth is
+always a markdown file of `- [ ]` / `- [x]` lines; the Discord message is just a view of it.
+
+- **Daily task list** — the `## Tasks` section of the vault's own daily note,
+  `DailyNotes/MMM DD, YYYY.md` (Obsidian daily-notes folder + format, `%b %d, %Y`). It syncs to
+  the phone, so ticking in Obsidian or in Discord hits the same file. `ensure_today()` adds the
+  section once per day — creating the note from `Templates/Default.md` if Obsidian hasn't, or
+  appending to a note already journalled in — from `DailyNotes/Recurring Tasks.md` plus the
+  unticked items of the latest earlier daily note (last 7 days, deduped against recurring).
+  `!task add` inserts at the end of that section, so journal text around it is untouched. `daily_loop()` posts it to `TASKS_CHANNEL_ID` at `TASKS_POST_TIME`,
+  or right after startup if the bot was down then and today's list isn't posted yet.
+- **Ad-hoc lists** — the shared `discord-checklist` skill tells Claude to emit a fenced ```` ```checklist ````
+  block (`# Title` + `- [ ] item` lines). `do_task` strips it with `extract_blocks()`, sends the
+  rest of the answer, then posts each list backed by `.claude/checklists/<key>.md`.
+- **Buttons** are `discord.ui.DynamicItem`s registered in `checklist.setup()`, custom_id
+  `ck:<key>:<line>:<sha1[:8] of text>` — they survive restarts with no stored view. A tap
+  toggles the line (line number first, hash fallback if the file was edited) and edits the
+  message. Only `DISCORD_ALLOWED_IDS` may tap; others get an ephemeral "Unauthorized.".
+- **Live refresh** — `watch_loop()` checks every 15s whether a tracked list's file mtime
+  changed (Claude appended a task, a tick in Obsidian) and re-renders the message. Tracking
+  (`key -> channel, message, mtime`) is in `.claude/checklists/messages.json` (gitignored);
+  entries drop after 14 days or when the message is deleted. `!tasks` re-posts and moves tracking.
+- Limits: 25 buttons (extra items listed as text), labels cut at 80 chars, markdown stripped.
+- How Claude should use all of this is the shared skill `~/.claude/skills/discord-checklist/SKILL.md`.
+
+## Skills index (`skills.py`)
+
+Every channel is told which skills exist, so a how-to written once is found from any channel.
+
+- `scan(cwd)` reads **shared** skills (`~/.claude/skills/<name>/SKILL.md`) and **project** skills
+  under `<cwd>/.claude/skills/` — native `<name>/SKILL.md` folders and loose `category/<name>.md`
+  files (zh-ai-support's layout, which Claude Code does not auto-list). Name/description come
+  from frontmatter (folded `>` YAML handled), else the first prose line of the body.
+- `build_points_block(cfg, cwd)` appends `index_block(cwd)` after the points: one line per skill,
+  `name — first sentence of description (≤90 chars) — path`. The `skills` base point tells Claude
+  to check it before a task, read the matching file, and save new reusable how-tos as skills
+  (every-channel -> `~/.claude/skills/`, project-only -> `.claude/skills/`). Scanned per task,
+  so a new skill shows up on the next message with no restart.
+- `!skills` lists the same for Gaurav; in the project-routing channel `!skills <project>` shows
+  that project's. `omit: ["skills"]` drops both the point and the index for a channel.

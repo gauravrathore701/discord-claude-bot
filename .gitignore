@@ -18,3 +18,6 @@ backups/
 *.bak-*
 *.bak.*
 *.bak2-*
+
+# Interactive checklist state (personal lists + message ids)
+.claude/checklists/
