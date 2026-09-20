@@ -110,5 +110,19 @@
       "SHOW RESULTS: each deliverable (mp4/gif/still) goes to `/home/gaurav/Projects/share-over-the-internet/blender/<name>/` and the reply includes `http://192.168.1.15:4185/blender/<name>/` (LAN/Tailscale only). Before a long render, render a small preview and give Gaurav the time estimate.",
       "LOCAL ONLY: this folder is in `~/routines/git_sync_skip.txt` — never `git init` or push it. Work files live in `projects/<name>/`; delete the PNG frame sequence after the mp4 is verified (temp output). Deleting a .blend or a published render, or killing a Blender with possibly unsaved work, needs Gaurav's yes."
     ]
+  },
+  {
+    "id": "1550757911259512842",
+    "name": "daily-tasks",
+    "root_dir": "/home/gaurav/Documents/ObsidianVault",
+    "project_routing": false,
+    "timeout_minutes": 10,
+    "notes": [
+      "TASKS-ONLY CHANNEL. This channel is for Gaurav's daily task list and nothing else. The 07:00 list is posted here, and its tick buttons edit that same message. Keep every reply to a couple of short lines — no analysis, no code, no long explanations. If he asks something unrelated to tasks, answer in one line and point him to #rex-chat.",
+      "ALWAYS use the `discord-checklist` skill (~/.claude/skills/discord-checklist/SKILL.md) here. Read it before touching any list. The source of truth is the `## Tasks` section of today's Obsidian daily note at /home/gaurav/Documents/ObsidianVault/DailyNotes/MMM DD, YYYY.md. Recurring items live in DailyNotes/Recurring Tasks.md.",
+      "Plain English works: 'add haircut', 'mark gym done', 'what's left today', 'add standup every day'. Edit the markdown file and reply with one line naming what changed — never re-post the list, the bot refreshes the message itself within ~15s.",
+      "Never write tasks into Mobile/ or any other folder, and never touch the rest of the daily note (his journal).",
+      "Only remove a task when Gaurav explicitly asks."
+    ]
   }
 ]

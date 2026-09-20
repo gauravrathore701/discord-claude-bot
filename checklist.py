@@ -39,7 +39,7 @@ RECURRING_FILE = os.path.join(TASKS_DIR, "Recurring Tasks.md")
 NOTE_TEMPLATE = os.path.join(VAULT, "Templates", "Default.md")
 DAILY_NAME = "%b %d, %Y"   # Obsidian daily-notes format "MMM DD, YYYY"
 TASKS_HEADING = "## Tasks"
-TASKS_CHANNEL_ID = int(os.environ.get("TASKS_CHANNEL_ID", "1508034882645786644"))  # #rex-chat
+TASKS_CHANNEL_ID = int(os.environ.get("TASKS_CHANNEL_ID", "1550757911259512842"))  # #daily-tasks
 TASKS_POST_TIME = os.environ.get("TASKS_POST_TIME", "07:00")
 
 MAX_BUTTONS = 25        # Discord hard limit: 5 rows x 5 buttons

@@ -840,31 +840,111 @@ def list_projects() -> str:
         return str(e)
 
 
-SLACK_QUERY_CAP  = 1500   # Slack renders one message; keep the relay readable
-SLACK_ANSWER_CAP = 2500
+SLACK_QUERY_CAP   = 1500   # the question, quoted in one block
+SLACK_ANSWER_CAP  = 9000   # the answer, split across section blocks past this it is cut
+SLACK_SECTION_CAP = 2900   # Slack's own limit on a section's text is 3000
 
 
-async def relay_to_slack(cfg: ChannelConfig, query: str, answer: str) -> None:
-    """Mirror a webhook-sourced Q&A to the channel's Slack webhook. Never raises —
-    a dead Slack must not affect the Discord answer that was already delivered."""
+def to_slack_mrkdwn(text: str) -> str:
+    """Discord/Claude markdown -> Slack mrkdwn. Slack has no `**bold**`, no `#` headers
+    and no `[text](url)`, so an unconverted answer reads as literal asterisks and stray
+    hashes. Code fences are passed through untouched — both dialects agree there."""
+    out, fence = [], False
+    for part in re.split(r'(```)', text):
+        if part == "```":
+            fence = not fence
+            out.append(part)
+            continue
+        if fence:
+            out.append(part)
+            continue
+        p = part
+        p = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)', r'<\2|\1>', p)   # links
+        # [ \t]* not \s* — a greedy \s*$ swallows the blank line after the heading
+        p = re.sub(r'^[ \t]*#{1,6}[ \t]*(.+?)[ \t]*$', r'*\1*', p, flags=re.M)
+        p = re.sub(r'\*\*(.+?)\*\*', r'*\1*', p, flags=re.S)               # bold
+        p = re.sub(r'__(.+?)__', r'_\1_', p, flags=re.S)                   # underline -> italic
+        p = re.sub(r'~~(.+?)~~', r'~\1~', p, flags=re.S)                   # strikethrough
+        p = re.sub(r'^(\s*)[-*+]\s+', r'\1• ', p, flags=re.M)              # bullets
+        out.append(p)
+    return "".join(out)
+
+
+def chunk_for_slack(text: str, cap: int = SLACK_SECTION_CAP) -> list[str]:
+    """Cut on line boundaries into section-sized pieces, reopening a ``` fence that
+    straddles a cut — same rule as split_for_discord(), different limit."""
+    chunks, cur, fence = [], "", False
+    for line in text.split("\n"):
+        while len(line) > cap:                      # a single monstrous line
+            if cur:
+                chunks.append(cur.rstrip("\n"))
+                cur = ""
+            chunks.append(line[:cap])
+            line = line[cap:]
+        if len(cur) + len(line) + 1 > cap and cur:
+            if fence:
+                cur += "\n```"
+            chunks.append(cur.rstrip("\n"))
+            cur = "```\n" if fence else ""
+        cur += line + "\n"
+        if line.strip().startswith("```"):
+            fence = not fence
+    if cur.strip():
+        chunks.append(cur.rstrip("\n"))
+    return chunks or ["(empty)"]
+
+
+async def relay_to_slack(cfg: ChannelConfig, query: str, answer: str,
+                         source: str = "Gaurav") -> None:
+    """Mirror a Q&A from this channel to its Slack webhook, as Block Kit so the question
+    and the answer are visibly separate. Never raises — a dead Slack must not affect the
+    Discord answer that was already delivered."""
     if not cfg.slack_webhook:
         return
 
-    def clip(s: str, cap: int) -> str:
-        s = s.strip()
-        return s if len(s) <= cap else s[:cap] + "\n… (truncated)"
+    q = query.strip() or "(no text — attachment only)"
+    truncated = False
+    if len(q) > SLACK_QUERY_CAP:
+        q, truncated = q[:SLACK_QUERY_CAP] + " …", True
+    a = answer.strip() or "(empty answer)"
+    if len(a) > SLACK_ANSWER_CAP:
+        a, truncated = a[:SLACK_ANSWER_CAP] + "\n…", True
 
-    body = (f"*Query* (via `{cfg.name}` Discord webhook)\n{clip(query, SLACK_QUERY_CAP)}\n\n"
-            f"*Answer*\n{clip(answer, SLACK_ANSWER_CAP)}")
+    # the query is block-quoted so it never blurs into the answer below it
+    quoted = "\n".join("> " + ln if ln.strip() else ">" for ln in to_slack_mrkdwn(q).split("\n"))
+
+    def section(t: str) -> dict:
+        return {"type": "section", "text": {"type": "mrkdwn", "text": t}}
+
+    blocks: list[dict] = [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": f"#{cfg.name}"[:150], "emoji": True}},
+        {"type": "context", "elements": [
+            {"type": "mrkdwn",
+             "text": f"*{source}* · {datetime.now().strftime('%d %b %Y, %H:%M')} IST"}]},
+        section(f":grey_question: *Question*\n{quoted}"),
+        {"type": "divider"},
+    ]
+    for i, part in enumerate(chunk_for_slack(to_slack_mrkdwn(a))):
+        blocks.append(section((":speech_balloon: *Answer*\n" if i == 0 else "") + part))
+    if truncated:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "_truncated — full text is in Discord_"}]})
+
+    payload = {
+        # plain-text fallback for the notification and for any client that can't render blocks
+        "text": f"[{cfg.name}] {source}: {q[:150]}",
+        "blocks": blocks[:50],                       # Slack refuses more than 50
+    }
     try:
         timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(cfg.slack_webhook, json={"text": body}) as resp:
+            async with session.post(cfg.slack_webhook, json=payload) as resp:
                 if resp.status >= 300:
                     detail = (await resp.text())[:200]
                     print(f"slack relay failed ({cfg.name}): {resp.status} {detail}", flush=True)
                 else:
-                    print(f"slack relay ok ({cfg.name})", flush=True)
+                    print(f"slack relay ok ({cfg.name}, {len(blocks)} blocks)", flush=True)
     except Exception as e:                                   # noqa: BLE001 — best effort
         print(f"slack relay error ({cfg.name}): {e}", flush=True)
 
@@ -1158,6 +1238,10 @@ async def on_message(message: discord.Message):
         except discord.HTTPException:
             pass
 
+    # who the Slack mirror credits the question to
+    slack_source = (message.author.display_name or "webhook") if is_webhook \
+        else (message.author.display_name or "Gaurav")
+
     ack = "Ack — webhook request received. Working in" if is_webhook else "Working in"
     status = await message.reply(f"{ack} `{cwd}`...")
 
@@ -1175,8 +1259,7 @@ async def on_message(message: discord.Message):
             await send_long(message.channel, shown or "(checklist below)", reply_to=message)
             for title, items in lists:
                 await checklist.post(message.channel, checklist.new_adhoc(title, items))
-            if is_webhook:
-                await relay_to_slack(cfg, text, output)
+            await relay_to_slack(cfg, text, output, slack_source)
         except asyncio.CancelledError:
             ping.cancel()
             try:
@@ -1184,8 +1267,8 @@ async def on_message(message: discord.Message):
             except discord.NotFound:
                 pass
             await message.reply("Task was cancelled.")
-            if is_webhook:
-                await relay_to_slack(cfg, text, "(task was cancelled before it finished)")
+            await relay_to_slack(cfg, text, "(task was cancelled before it finished)",
+                                 slack_source)
         finally:
             for p in image_paths:
                 try:
