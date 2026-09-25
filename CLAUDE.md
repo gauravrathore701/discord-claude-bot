@@ -130,6 +130,19 @@ always a markdown file of `- [ ]` / `- [x]` lines; the Discord message is just a
   unticked items of the latest earlier daily note (last 7 days, deduped against recurring).
   `!task add` inserts at the end of that section, so journal text around it is untouched. `daily_loop()` posts it to `TASKS_CHANNEL_ID` at `TASKS_POST_TIME`,
   or right after startup if the bot was down then and today's list isn't posted yet.
+- **Three task types** (2026-09-24). *Every day* -> `DailyNotes/Recurring Tasks.md`, copied into
+  every note. *One-off* -> a plain line in today's `## Tasks`; unticked items carry over, a ticked
+  one is gone. *A specific date* -> `DailyNotes/Scheduled Tasks.md`, one `- [ ] YYYY-MM-DD | task`
+  per line. `_take_due()` pulls everything dated on or before today into the note and ticks the
+  source line so it is never injected twice; from then on the normal carry-over gives the
+  "unticked on 1 Oct shows again on 2 Oct, ticked does not" behaviour for free. `ensure_today()`
+  also runs `_take_due()` on the early-return path, so a task scheduled for today after 07:00
+  still lands on today's list. `parse_when()` reads `1 oct`, `oct 1`, `1st oct`, `2026-10-01`,
+  `1/10`, `today`, `tomorrow` and weekday names, taking the next occurrence when no year is given.
+  Commands: `!task add <text> on <date>`, `!task every <text>`, `!task sched`.
+- **Section scoping** (2026-09-24) — `read_items(path, section)` / `read_tasks(key)` read only the
+  `## Tasks` section of a daily note. A `- [ ]` Gaurav writes in his own journal prose no longer
+  leaks into the Discord list.
 - **Ad-hoc lists** — the shared `discord-checklist` skill tells Claude to emit a fenced ```` ```checklist ````
   block (`# Title` + `- [ ] item` lines). `do_task` strips it with `extract_blocks()`, sends the
   rest of the answer, then posts each list backed by `.claude/checklists/<key>.md`.

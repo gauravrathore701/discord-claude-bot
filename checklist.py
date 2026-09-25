@@ -36,6 +36,7 @@ TRACK_FILE = os.path.join(ADHOC_DIR, "messages.json")
 VAULT = os.environ.get("OBSIDIAN_VAULT", "/home/gaurav/Documents/ObsidianVault")
 TASKS_DIR = os.environ.get("TASKS_DIR", os.path.join(VAULT, "DailyNotes"))
 RECURRING_FILE = os.path.join(TASKS_DIR, "Recurring Tasks.md")
+SCHEDULED_FILE = os.path.join(TASKS_DIR, "Scheduled Tasks.md")
 NOTE_TEMPLATE = os.path.join(VAULT, "Templates", "Default.md")
 DAILY_NAME = "%b %d, %Y"   # Obsidian daily-notes format "MMM DD, YYYY"
 TASKS_HEADING = "## Tasks"
@@ -49,6 +50,7 @@ WATCH_INTERVAL = 15     # seconds between file-change checks
 TRACK_DAYS = 14         # stop watching messages older than this
 
 ITEM_RE = re.compile(r"^(\s*[-*]\s+\[)([ xX])(\]\s+)(.+?)\s*$")
+SCHED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*\|\s*(.+)$")   # inside a checkbox item
 HEADING_RE = re.compile(r"^#{1,6}\s")
 BLOCK_RE = re.compile(r"```checklist[^\n]*\n(.*?)```", re.S)
 
@@ -74,19 +76,40 @@ def path_for(key: str) -> str:
     return os.path.join(ADHOC_DIR, f"{key}.md")
 
 
-def read_items(path: str) -> list[tuple[int, bool, str]]:
-    """(line_no, done, text) for every checkbox line."""
+def _section_bounds(lines: list[str], heading: str) -> tuple[int, int]:
+    """(first line after `heading`, first line of the next heading). (0, len) when
+    the heading isn't there, so a file without sections reads whole."""
+    start = next((n for n, l in enumerate(lines) if l.strip() == heading), None)
+    if start is None:
+        return 0, len(lines)
+    end = next((n for n in range(start + 1, len(lines)) if HEADING_RE.match(lines[n])),
+               len(lines))
+    return start + 1, end
+
+
+def read_items(path: str, section: str | None = None) -> list[tuple[int, bool, str]]:
+    """(line_no, done, text) for every checkbox line, optionally only the ones
+    under `section`. A daily note is also a journal, so a `- [ ]` Gaurav writes
+    in his own prose must not leak into the task list."""
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.read().split("\n")
     except OSError:
         return []
+    lo, hi = _section_bounds(lines, section) if section else (0, len(lines))
     out = []
-    for n, line in enumerate(lines):
-        m = ITEM_RE.match(line)
+    for n in range(lo, hi):
+        m = ITEM_RE.match(lines[n])
         if m:
             out.append((n, m.group(2) != " ", m.group(4)))
     return out
+
+
+def read_tasks(key: str) -> list[tuple[int, bool, str]]:
+    """The items a checklist message shows: the `## Tasks` section of a daily
+    note, the whole file for an ad-hoc list."""
+    path = path_for(key)
+    return read_items(path, TASKS_HEADING if key.startswith("d") else None)
 
 
 def _write(path: str, text: str):
@@ -162,7 +185,7 @@ def add_item(key: str, text: str):
 def remove_item(key: str, index: int) -> str | None:
     """Drop the index-th item (1-based, as shown in Discord). Returns its text."""
     path = path_for(key)
-    items = read_items(path)
+    items = read_tasks(key)
     if not 1 <= index <= len(items):
         return None
     line_no, _, text = items[index - 1]
@@ -171,6 +194,141 @@ def remove_item(key: str, index: int) -> str | None:
     del lines[line_no]
     _write(path, "\n".join(lines))
     return text
+
+
+SCHEDULED_HEADER = (
+    "**Tags:** #tasks\n\n"
+    "Tasks for a specific date. One `- [ ] YYYY-MM-DD | task` per line.\n"
+    "On that date the task is copied into the daily note and the line here is\n"
+    "ticked off, so it is never injected twice. If it is left unticked in the\n"
+    "daily note it carries to the next day on its own; tick it and it is gone.\n\n")
+
+
+def schedule_item(when: date, text: str):
+    """Queue a task for a future date in Scheduled Tasks.md."""
+    try:
+        with open(SCHEDULED_FILE, encoding="utf-8") as f:
+            body = f.read()
+    except OSError:
+        body = SCHEDULED_HEADER
+    body = body.rstrip("\n") + "\n" if body.strip() else SCHEDULED_HEADER
+    _write(SCHEDULED_FILE, f"{body}- [ ] {when:%Y-%m-%d} | {text.strip()}\n")
+
+
+def scheduled_items() -> list[tuple[date, bool, str]]:
+    """(date, already injected, text) for every parseable line in the file."""
+    out = []
+    for _, done, raw in read_items(SCHEDULED_FILE):
+        m = SCHED_RE.match(raw)
+        if not m:
+            continue
+        try:
+            when = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        out.append((when, done, m.group(2).strip()))
+    return out
+
+
+def _take_due(today: date) -> list[str]:
+    """Pull the tasks due on or before `today`, and tick their lines so the next
+    morning doesn't inject them again. A task left unticked in the daily note
+    still reaches tomorrow through the normal carry-over."""
+    try:
+        with open(SCHEDULED_FILE, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return []
+    due, touched = [], False
+    for n, line in enumerate(lines):
+        m = ITEM_RE.match(line)
+        if not m or m.group(2) != " ":
+            continue
+        s = SCHED_RE.match(m.group(4))
+        if not s:
+            continue
+        try:
+            when = datetime.strptime(s.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if when <= today:
+            due.append(s.group(2).strip())
+            lines[n] = f"{m.group(1)}x{m.group(3)}{m.group(4)}"
+            touched = True
+    if touched:
+        _write(SCHEDULED_FILE, "\n".join(lines))
+    return due
+
+
+MONTHS = {m: n for n, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday",
+            "saturday", "sunday"]
+ON_RE = re.compile(r"^(?P<text>.+?)\s+(?:on|for)\s+(?P<when>[^,]{2,20})$", re.I)
+
+
+def parse_when(s: str, today: date | None = None) -> date | None:
+    """A date out of the shapes Gaurav actually types. None if it isn't one.
+
+    Bare day/month with no year takes the next occurrence, so "1 oct" typed in
+    December means next October, not one ten months gone.
+    """
+    today = today or date.today()
+    s = s.strip().lower().rstrip(".")
+    if s in ("today", "aaj"):
+        return today
+    if s in ("tomorrow", "tmrw", "kal"):
+        return today + timedelta(days=1)
+    if s.startswith("next "):
+        s = s[5:].strip()
+    for n, name in enumerate(WEEKDAYS):
+        if s == name or s == name[:3]:
+            ahead = (n - today.weekday()) % 7 or 7
+            return today + timedelta(days=ahead)
+
+    s = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", s)
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d/%m", "%d-%m"):
+        try:
+            d = datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+        if "%Y" not in fmt:
+            d = d.replace(year=today.year)
+            if d < today:
+                d = d.replace(year=today.year + 1)
+        return d
+
+    m = re.fullmatch(r"(\d{1,2})\s+([a-z]{3,9})(?:\s+(\d{4}))?", s) \
+        or re.fullmatch(r"([a-z]{3,9})\s+(\d{1,2})(?:\s+(\d{4}))?", s)
+    if not m:
+        return None
+    a, b, year = m.groups()
+    day, mon = (a, b) if a.isdigit() else (b, a)
+    month = MONTHS.get(mon[:3])
+    if month is None:
+        return None
+    try:
+        d = date(int(year) if year else today.year, month, int(day))
+    except ValueError:
+        return None
+    if not year and d < today:
+        try:
+            d = d.replace(year=today.year + 1)
+        except ValueError:        # 29 Feb into a non-leap year
+            return None
+    return d
+
+
+def add_recurring(text: str):
+    """Add a task that shows up every day."""
+    try:
+        with open(RECURRING_FILE, encoding="utf-8") as f:
+            body = f.read()
+    except OSError:
+        body = ""
+    body = body.rstrip("\n") + "\n" if body.strip() else ""
+    _write(RECURRING_FILE, f"{body}- [ ] {text.strip()}\n")
 
 
 def ensure_today(today: date | None = None) -> str:
@@ -187,6 +345,13 @@ def ensure_today(today: date | None = None) -> str:
     except OSError:
         existing = None
     if existing is not None and any(l.strip() == TASKS_HEADING for l in existing.split("\n")):
+        # section already built today: still pull anything scheduled since, so a
+        # task added for today after 07:00 lands on today's list, not tomorrow's
+        have = {_h(t) for _, _, t in read_items(path, TASKS_HEADING)}
+        for t in _take_due(today):
+            if _h(t) not in have:
+                add_item(key, t)
+                have.add(_h(t))
         return key
 
     if not os.path.exists(RECURRING_FILE):
@@ -195,13 +360,15 @@ def ensure_today(today: date | None = None) -> str:
                "Copied into the `## Tasks` section of every daily note. "
                "One `- [ ] task` per line.\n\n")
     recurring = [t for _, _, t in read_items(RECURRING_FILE)]
+    if not os.path.exists(SCHEDULED_FILE):
+        _write(SCHEDULED_FILE, SCHEDULED_HEADER)
 
     carried: list[str] = []
     for back in range(1, CARRY_LOOKBACK + 1):
         prev = path_for(daily_key(today - timedelta(days=back)))
         if os.path.exists(prev):
             seen = {_h(t) for t in recurring}
-            for _, done, t in read_items(prev):
+            for _, done, t in read_items(prev, TASKS_HEADING):
                 if not done and _h(t) not in seen:
                     carried.append(t)
                     seen.add(_h(t))
@@ -213,8 +380,15 @@ def ensure_today(today: date | None = None) -> str:
                 existing = f.read()
         except OSError:
             existing = "**Tags:**\n"
+    seen = {_h(t) for t in recurring + carried}
+    due = []
+    for t in _take_due(today):
+        if _h(t) not in seen:
+            due.append(t)
+            seen.add(_h(t))
+
     body = existing.rstrip("\n") + "\n\n" if existing.strip() else ""
-    section = [TASKS_HEADING] + [f"- [ ] {t}" for t in recurring + carried]
+    section = [TASKS_HEADING] + [f"- [ ] {t}" for t in recurring + carried + due]
     _write(path, body + "\n".join(section) + "\n")
     return key
 
@@ -265,7 +439,7 @@ class ToggleButton(discord.ui.DynamicItem[discord.ui.Button],
 
 
 def render(key: str) -> tuple[str, discord.ui.View]:
-    items = read_items(path_for(key))
+    items = read_tasks(key)
     done = sum(1 for _, d, _ in items if d)
     view = discord.ui.View(timeout=None)
     for line_no, d, text in items[:MAX_BUTTONS]:
@@ -417,9 +591,15 @@ HELP = (
     "**Task list** (no Claude call)\n"
     "`!tasks` — post today's list here\n"
     "`!task add <text>` — add to today\n"
+    "`!task add <text> on <date>` — for that day only\n"
+    "`!task every <text>` — every day\n"
     "`!task rm <n>` — remove item n\n"
+    "`!task sched` — what's queued for later\n"
+    "Dates: `1 oct`, `oct 1`, `2026-10-01`, `1/10`, "
+    "`today`, `tomorrow`, `monday`.\n"
     "Tap a button to tick / untick. Tasks live in today's daily note "
-    "(`DailyNotes/`), recurring ones in `DailyNotes/Recurring Tasks.md`."
+    "(`DailyNotes/`), daily ones in `Recurring Tasks.md`, dated ones in "
+    "`Scheduled Tasks.md`."
 )
 
 
@@ -439,10 +619,38 @@ async def handle(message: discord.Message, text: str) -> bool:
         await post(message.channel, key)
         return True
 
-    if sub == "add" and arg:
+    if sub in ("every", "daily") and arg:
         async with _lock:
+            add_recurring(arg[:200])
             ensure_today()
             add_item(key, arg[:200])
+        await message.reply(f"Every day from now: **{arg[:200]}** (also on today's list).")
+        return True
+
+    if sub == "sched" or (sub == "add" and not arg):
+        pending = [(w, t) for w, done, t in scheduled_items() if not done]
+        if not pending:
+            await message.reply("Nothing scheduled for a later date.")
+            return True
+        lines = "\n".join(f"- **{w:%a %d %b}** — {t}" for w, t in sorted(pending)[:20])
+        await message.reply(f"**Scheduled**\n{lines}")
+        return True
+
+    if sub == "add" and arg:
+        text, when = arg[:200], None
+        m = ON_RE.match(text)
+        if m:
+            when = parse_when(m.group("when"))
+            if when:
+                text = m.group("text").strip()
+        if when and when > date.today():
+            async with _lock:
+                schedule_item(when, text)
+            await message.reply(f"Scheduled for **{when:%a %d %b}**: {text}")
+            return True
+        async with _lock:
+            ensure_today()
+            add_item(key, text)
         # watch_loop refreshes the posted message; post one if today has none yet
         if key not in _load_track():
             await post(message.channel, key)
