@@ -102,7 +102,7 @@
     "name": "animation",
     "root_dir": "/home/gaurav/Projects/Animations",
     "project_routing": false,
-    "timeout_minutes": 30,
+    "timeout_minutes": 180,
     "notes": [
       "ANIMATION CHANNEL (#rex-animation). Blender modelling/animation on the Pi via the `blender` MCP server. Read `/home/gaurav/Projects/Animations/CLAUDE.md` first every task — it has the Pi/Blender setup, workflow and layout. Check `.claude/skills/` for an existing skill before working something out from scratch, and follow it.",
       "START BLENDER FIRST: before any mcp__blender__ call, check `ss -ltn | grep ':9876 '`; if down run `/home/gaurav/Projects/.claude/tools/blender-mcp/start-blender.sh` (skill: blender-session). Cycles CPU with use_denoising=False is the default engine; never render long jobs through MCP — save the .blend and render headless (skill: blender-render-publish), detached via `systemd-run --user` when over ~5 min.",
