@@ -19,6 +19,11 @@ CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 REMINDERS_FILE = "/home/gaurav/Projects/daily-script/reminder/reminders.txt"
 
+# !wakepc — magic packet to the Nitro 5 over the direct 192.168.50.0/24 link.
+WOL_SCRIPT = "/home/gaurav/Projects/daily-script/wol_pc.sh"
+WOL_TIMEOUT = 120  # the script itself gives up at 90s
+PC_IP = "192.168.50.2"
+
 # !reboot is two-step. This holds the deadline for the confirm step.
 _reboot_armed_until: float = 0.0
 REBOOT_CONFIRM_WINDOW = 60  # seconds
@@ -241,10 +246,31 @@ def remind(arg: str) -> str:
             "The notifier picks it up on its next run.")
 
 
+def wakepc() -> str:
+    """Wake the Nitro 5 over the direct Pi<->PC Ethernet link."""
+    try:
+        r = subprocess.run([WOL_SCRIPT], capture_output=True, text=True,
+                           timeout=WOL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "❌ Gave up waiting — the PC never answered."
+    except OSError as e:
+        return f"Could not run the wake script: {type(e).__name__}"
+
+    out = (r.stdout + r.stderr).strip() or "no output"
+    if r.returncode != 0:
+        return (f"❌ Wake failed.\n```\n{out[:300]}\n```\n"
+                "Check the cable, and that the PC was shut down "
+                "cleanly rather than losing power.")
+    if "already up" in out:
+        return f"✅ Already awake — {PC_IP} is answering."
+    return f"✅ PC is up.\n```\n{out[:300]}\n```"
+
+
 HELP = (
     "**Pi ops commands** (no Claude call, no tokens)\n"
     "`!usage` — Claude session + weekly usage, with reset times\n"
     "`!ip` — LAN address, public address, interface\n"
+    "`!wakepc` — wake the Nitro 5 over the direct LAN link\n"
     "`!reboot` — reboot the Pi (asks to confirm)\n"
     "`!remind <when> | <message>` — add a reminder\n"
     "`!ops` — this list\n\n"
@@ -264,6 +290,8 @@ def handle(text: str) -> str | None:
         return usage()
     if cmd == "!ip":
         return ip()
+    if cmd in ("!wakepc", "!wake"):
+        return wakepc()
     if cmd == "!reboot":
         return reboot(arg)
     if cmd == "!remind":
