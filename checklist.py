@@ -46,6 +46,7 @@ TASKS_POST_TIME = os.environ.get("TASKS_POST_TIME", "07:00")
 MAX_BUTTONS = 25        # Discord hard limit: 5 rows x 5 buttons
 LABEL_MAX = 80          # Discord hard limit on a button label
 CARRY_LOOKBACK = 7      # days back to look for yesterday's list
+LOCK_AFTER_DAYS = 3     # a daily list is read-only once it is older than this
 WATCH_INTERVAL = 15     # seconds between file-change checks
 TRACK_DAYS = 14         # stop watching messages older than this
 
@@ -67,6 +68,17 @@ def _h(text: str) -> str:
 
 def daily_key(d: date) -> str:
     return f"d{d:%Y%m%d}"
+
+
+def locked(key: str, today: date | None = None) -> bool:
+    """True when a daily list is too old to tick. Today, yesterday and the day
+    before stay editable; from the third day back the buttons go dead, so the
+    record the tracker keeps (daily-script/tasks/track_tasks.py, same 3-day
+    window) cannot be rewritten after the fact. Ad-hoc lists never lock."""
+    if not key.startswith("d"):
+        return False
+    d = datetime.strptime(key[1:], "%Y%m%d").date()
+    return ((today or date.today()) - d).days >= LOCK_AFTER_DAYS
 
 
 def path_for(key: str) -> str:
@@ -410,12 +422,14 @@ def _label(text: str) -> str:
 
 class ToggleButton(discord.ui.DynamicItem[discord.ui.Button],
                    template=r"ck:(?P<key>[a-z0-9]+):(?P<n>\d+):(?P<h>[0-9a-f]{8})"):
-    def __init__(self, key: str, line_no: int, h: str, label: str = "…", done: bool = False):
+    def __init__(self, key: str, line_no: int, h: str, label: str = "…", done: bool = False,
+                 disabled: bool = False):
         super().__init__(discord.ui.Button(
             label=label,
             emoji="✅" if done else "⬜",
             style=discord.ButtonStyle.success if done else discord.ButtonStyle.secondary,
             custom_id=f"ck:{key}:{line_no}:{h}",
+            disabled=disabled,
         ))
         self.key, self.line_no, self.h = key, line_no, h
 
@@ -426,6 +440,13 @@ class ToggleButton(discord.ui.DynamicItem[discord.ui.Button],
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id not in _allowed_ids:
             await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        if locked(self.key):
+            # an old message whose view was built before the list locked
+            await interaction.response.send_message(
+                f"That list is older than {LOCK_AFTER_DAYS} days — locked. "
+                "Edit the daily note in Obsidian if it is genuinely wrong.",
+                ephemeral=True)
             return
         async with _lock:
             ok = toggle(self.key, self.line_no, self.h)
@@ -441,15 +462,18 @@ class ToggleButton(discord.ui.DynamicItem[discord.ui.Button],
 def render(key: str) -> tuple[str, discord.ui.View]:
     items = read_tasks(key)
     done = sum(1 for _, d, _ in items if d)
+    shut = locked(key)
     view = discord.ui.View(timeout=None)
     for line_no, d, text in items[:MAX_BUTTONS]:
-        view.add_item(ToggleButton(key, line_no, _h(text), _label(text), d))
+        view.add_item(ToggleButton(key, line_no, _h(text), _label(text), d, shut))
 
     head = _title(key)
     if not items:
         return f"**{head}**\nNothing on the list. Add with `!task add <text>`.", view
     status = "🎉 all done" if done == len(items) else f"{done}/{len(items)} done"
     content = f"**{head}** — {status}"
+    if shut:
+        content += f" · 🔒 locked (over {LOCK_AFTER_DAYS} days old)"
     extra = items[MAX_BUTTONS:]
     if extra:
         content += f"\n{len(extra)} more (no room for buttons — tick in Obsidian):"
@@ -508,8 +532,10 @@ async def watch_loop():
                     changed = True
                     continue
                 mtime = os.path.getmtime(path)
-                if mtime == t.get("mtime"):
+                shut = locked(key)
+                if mtime == t.get("mtime") and shut == t.get("locked", False):
                     continue
+                t["locked"] = shut
                 async with _lock:
                     content, view = render(key)
                     msg = _client.get_partial_messageable(t["channel"]).get_partial_message(t["message"])
