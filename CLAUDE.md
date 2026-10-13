@@ -38,6 +38,8 @@ Defined in `.env` (see `.env.example`):
 - `TASK_TIMEOUT` — seconds before a task is killed (default: `600`); a channel can override it with `timeout_minutes` / `timeout` in `channels.json`
 - `CAVEMAN_SKILL_FILE` — path to the `/caveman` SKILL.md injected into every task (default: `/home/gaurav/.claude/skills/caveman/SKILL.md`)
 - `CAVEMAN_LEVEL` — intensity the skill is pinned to (default: `ultra`; `off` disables the injection)
+- `PONYTAIL_SKILL_FILE` — path to the `/ponytail` SKILL.md injected into every task (default: `/home/gaurav/.claude/skills/ponytail/SKILL.md`)
+- `PONYTAIL_LEVEL` — level the skill is pinned to (default: `full`; `off` disables the injection)
 - `STARTUP_CHANNEL_ID` — the one channel that gets the startup announcement (default: `1537133272319008798`). On `on_ready` the bot posts `**Claudy Rex online.**` plus an `ssh gaurav@<ip>` block there, and nowhere else. The IP comes from `lan_ip()` (`ip -4 route get 1.1.1.1`, `src` field) so it is the address reachable from the phone, not a docker bridge. This channel does not need an entry in `channels.json` — it only receives the message; add it there too if it should also accept tasks.
 - `TASKS_CHANNEL_ID` — channel the daily task list is posted to (default: `1508034882645786644`, #rex-chat)
 - `TASKS_POST_TIME` — `HH:MM` local time the daily task list is posted (default: `07:00`)
@@ -101,7 +103,7 @@ The bot is `bot.py`, plus `ops.py` (native `!` ops commands), `checklist.py` (bu
 5. **Cancellation** — each channel's `ChannelState.active_proc` / `active_task` track its running subprocess and asyncio task so `!cancel` in that channel kills both, without affecting other channels.
 6. **Daily rollover** — `daily_rollover_loop()` fires once per day at 06:30 (moved from 04:45 on 2026-09-17 so its Claude calls land in the 06:30 usage window) and rotates/summarizes every configured channel's session independently.
 
-Built-in bot commands (per-channel): `!help`, `!projects`, `!points`, `!cancel` / `!stop`, `!status`, `!session`, `!newsession`, `!skills [project]`, `!tasks` / `!task add <text>` / `!task rm <n>`, `model <name>`, `/caveman <level>`.
+Built-in bot commands (per-channel): `!help`, `!projects`, `!points`, `!cancel` / `!stop`, `!status`, `!session`, `!newsession`, `!skills [project]`, `!tasks` / `!task add <text>` / `!task rm <n>`, `model <name>`, `/caveman <level>`, `/ponytail <level>`.
 
 ## Caveman level
 
@@ -116,6 +118,31 @@ the text handler; all three call the same `set_caveman()`. Valid levels:
 `lite`, `full`, `ultra`, `wenyan-lite`, `wenyan-full`, `wenyan-ultra`, plus `off` (no skill
 injected at all) and `default` (fall back to `CAVEMAN_LEVEL`). No argument prints the current
 level and where it came from.
+
+## Ponytail level
+
+Same machinery as caveman, second dial. `ponytail_prompt(level)` builds its
+`--append-system-prompt` text from `PONYTAIL_SKILL_FILE` (cached per level), and
+`run_claude()` joins the caveman and ponytail prompts with a blank line into **one**
+`--append-system-prompt` argument. They are orthogonal: caveman compresses the PROSE of a
+reply, ponytail compresses the CODE written, and the ponytail preamble says so explicitly so
+neither skill is read as overriding the other.
+
+Per-channel level is `ChannelState.ponytail or PONYTAIL_LEVEL`, persisted to
+`.claude/sessions/<channel_id>/ponytail.json`. `/ponytail <level>` (application command),
+`!ponytail <level>` and a bare `ponytail <level>` all call `set_ponytail()`. Valid levels:
+`lite`, `full`, `ultra`, plus `off` and `default`. Webhook callers are refused, same as
+`model` and `caveman`.
+
+Levels, from the skill: **lite** builds what was asked and names the smaller option;
+**full** is the 6-rung ladder (does it need to exist -> reuse in-codebase -> stdlib/platform
+-> installed dep -> one line -> minimum code); **ultra** also pushes back on parts of the
+request the need does not justify. Safety is never traded: validation at trust boundaries,
+error handling, security and accessibility stay mandatory at every level.
+
+Sub-skills installed alongside it in `~/.claude/skills/`, so every channel sees them in the
+index: `ponytail-review` (review a change), `ponytail-audit` (whole-repo bloat scan),
+`ponytail-debt` (list `shortcut:` comments as a ledger), `ponytail-gain`, `ponytail-help`.
 
 ## Interactive checklists (`checklist.py`)
 

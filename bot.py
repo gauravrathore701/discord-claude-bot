@@ -49,6 +49,12 @@ CAVEMAN_SKILL_FILE = os.environ.get(
     "CAVEMAN_SKILL_FILE", "/home/gaurav/.claude/skills/caveman/SKILL.md")
 CAVEMAN_LEVEL = os.environ.get("CAVEMAN_LEVEL", "ultra")
 
+# Same deal for /ponytail. Caveman compresses the prose of a reply, ponytail
+# compresses the code written — they stack, so both can be injected at once.
+PONYTAIL_SKILL_FILE = os.environ.get(
+    "PONYTAIL_SKILL_FILE", "/home/gaurav/.claude/skills/ponytail/SKILL.md")
+PONYTAIL_LEVEL = os.environ.get("PONYTAIL_LEVEL", "full")
+
 # One startup announcement, in this channel only, instead of one per configured
 # channel. It carries the Pi's current LAN IP because a logged-out Claude account
 # leaves no other way in — without the IP the Pi needs a monitor and keyboard.
@@ -88,6 +94,37 @@ def caveman_prompt(level: str) -> str:
         f"normal prose. Only 'stop caveman' / 'normal mode' from the user turns it off."
     )
     _caveman_cache[level] = prompt
+    return prompt
+
+
+PONYTAIL_LEVELS = ("lite", "full", "ultra")
+_ponytail_cache: dict[str, str] = {}
+
+
+def ponytail_prompt(level: str) -> str:
+    """Same as caveman_prompt, for the /ponytail code-minimalism skill."""
+    level = (level or "off").lower()
+    if level == "off":
+        return ""
+    if level in _ponytail_cache:
+        return _ponytail_cache[level]
+    try:
+        with open(PONYTAIL_SKILL_FILE) as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"[ponytail] skill NOT loaded: {e}", flush=True)
+        _ponytail_cache[level] = ""
+        return ""
+    body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.S).strip()
+    prompt = (
+        f"The /ponytail skill is ACTIVE for every response, as if invoked with "
+        f"`/ponytail {level}`. Its full text follows — follow it.\n\n"
+        f"{body}\n\n"
+        f"Locked level: {level.upper()}. Persists across turns. Only 'stop ponytail' / "
+        f"'normal mode' from the user turns it off. This governs the CODE you write; "
+        f"any caveman skill above governs the PROSE you write. Both apply."
+    )
+    _ponytail_cache[level] = prompt
     return prompt
 
 intents = discord.Intents.default()
@@ -203,6 +240,7 @@ class ChannelState:
     prev_context_injected: bool = False
     model: str | None = None
     caveman: str | None = None      # None => CAVEMAN_LEVEL default from .env
+    ponytail: str | None = None     # None => PONYTAIL_LEVEL default from .env
     active_proc: asyncio.subprocess.Process | None = None
     active_task: asyncio.Task | None = None
 
@@ -282,6 +320,7 @@ def channel_paths(state: ChannelState) -> dict[str, str]:
         "session": os.path.join(d, "current.json"),
         "model": os.path.join(d, "model.json"),
         "caveman": os.path.join(d, "caveman.json"),
+        "ponytail": os.path.join(d, "ponytail.json"),
         "history": os.path.join(d, "chat_history.json"),
         "summary": os.path.join(d, "prev_summary.json"),
     }
@@ -419,6 +458,63 @@ def set_caveman(state: ChannelState, arg: str | None) -> str:
     note = " — plain Claude, skill not injected" if eff == "off" else ""
     return (f"Caveman set to `{state.caveman or 'default'}` (effective: `{eff}`){note}. "
             f"Applies to the next message, this channel only.")
+
+
+def load_ponytail(state: ChannelState):
+    try:
+        with open(channel_paths(state)["ponytail"]) as f:
+            state.ponytail = json.load(f).get("ponytail")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def save_ponytail(state: ChannelState):
+    os.makedirs(state.sessions_dir, exist_ok=True)
+    with open(channel_paths(state)["ponytail"], "w") as f:
+        json.dump({"ponytail": state.ponytail}, f, indent=2)
+
+
+PONYTAIL_CHOICES = (*PONYTAIL_LEVELS, "off", "default")
+
+
+def set_ponytail(state: ChannelState, arg: str | None) -> str:
+    """Shared by the `!ponytail` text command and the /ponytail slash command."""
+    valid = ", ".join(PONYTAIL_CHOICES)
+    if not arg:
+        eff = state.ponytail or PONYTAIL_LEVEL
+        src = "channel override" if state.ponytail else f"default ({PONYTAIL_LEVEL})"
+        return f"Ponytail level: `{eff}` — {src}\nSet with `/ponytail <level>`. Valid: {valid}"
+
+    choice = arg.strip().lower()
+    if choice == "default":
+        state.ponytail = None
+    elif choice in PONYTAIL_LEVELS or choice == "off":
+        state.ponytail = choice
+    else:
+        return f"Unknown level `{arg}`. Valid: {valid}"
+
+    save_ponytail(state)
+    eff = state.ponytail or PONYTAIL_LEVEL
+    note = " — skill not injected" if eff == "off" else ""
+    return (f"Ponytail set to `{state.ponytail or 'default'}` (effective: `{eff}`){note}. "
+            f"Applies to the next message, this channel only.")
+
+
+@tree.command(name="ponytail", description="Set the ponytail (code minimalism) level for this channel")
+@discord.app_commands.describe(level="lite / full / ultra, or off / default. Omit to show the current one.")
+@discord.app_commands.choices(
+    level=[discord.app_commands.Choice(name=c, value=c) for c in PONYTAIL_CHOICES]
+)
+async def ponytail_slash(interaction: discord.Interaction, level: str = ""):
+    cfg = CHANNELS.get(interaction.channel_id)
+    if cfg is None:
+        await interaction.response.send_message(
+            "This channel isn't configured for Claude tasks.", ephemeral=True)
+        return
+    if interaction.user.id not in ALLOWED_IDS:
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"[{cfg.name}] {set_ponytail(STATES[cfg.id], level)}")
 
 
 @tree.command(name="caveman", description="Set the caveman skill level for this channel")
@@ -627,7 +723,10 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     )
 
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
-    prompt = caveman_prompt(state.caveman or CAVEMAN_LEVEL)
+    prompt = "\n\n".join(p for p in (
+        caveman_prompt(state.caveman or CAVEMAN_LEVEL),
+        ponytail_prompt(state.ponytail or PONYTAIL_LEVEL),
+    ) if p)
     if prompt:
         cmd += ["--append-system-prompt", prompt]
     if state.model:
@@ -979,6 +1078,7 @@ async def on_ready():
         load_session(state)
         load_model(state)
         load_caveman(state)
+        load_ponytail(state)
     print(f"Online as {client.user}", flush=True)
     print(f"Configured channels: "
           f"{[(cid, cfg.name, fmt_secs(channel_timeout(cfg))) for cid, cfg in CHANNELS.items()]}",
@@ -986,9 +1086,14 @@ async def on_ready():
     dflt = caveman_prompt(CAVEMAN_LEVEL)
     print(f"caveman default: {CAVEMAN_LEVEL} ({len(dflt)} chars from {CAVEMAN_SKILL_FILE})"
           if dflt else f"caveman default: {CAVEMAN_LEVEL} (no skill text loaded)", flush=True)
+    pdflt = ponytail_prompt(PONYTAIL_LEVEL)
+    print(f"ponytail default: {PONYTAIL_LEVEL} ({len(pdflt)} chars from {PONYTAIL_SKILL_FILE})"
+          if pdflt else f"ponytail default: {PONYTAIL_LEVEL} (no skill text loaded)", flush=True)
     for cid, st in STATES.items():
         if st.caveman:
             print(f"  channel {CHANNELS[cid].name}: caveman override -> {st.caveman}", flush=True)
+        if st.ponytail:
+            print(f"  channel {CHANNELS[cid].name}: ponytail override -> {st.ponytail}", flush=True)
     # register /caveman per guild — guild syncs are instant, global ones take ~1h
     guild_ids = {ch.guild.id for cid in CHANNELS
                  if (ch := client.get_channel(cid)) is not None and getattr(ch, "guild", None)}
@@ -1049,7 +1154,7 @@ async def on_message(message: discord.Message):
     # A webhook is an unattended caller: it may ask questions, never drive the bot's
     # own controls (!cancel, !newsession, model/caveman switches).
     if is_webhook and re.match(
-            r'^[!/]|^(model|caveman)\s+'
+            r'^[!/]|^(model|caveman|ponytail)\s+'
             r'(lite|full|ultra|wenyan-\w+|off|default|sonnet|opus|haiku|fable)$',
             text, re.IGNORECASE):
         await message.reply("Webhook callers can send questions only, not bot commands.")
@@ -1099,7 +1204,9 @@ async def on_message(message: discord.Message):
             "`!tasks` — post today's task list (`!task add <text>`, `!task rm <n>`)\n"
             "`model <sonnet|opus|haiku|fable|default>` — switch model (also `!model`, no arg shows current)\n"
             "`/caveman <lite|full|ultra|wenyan-lite|wenyan-full|wenyan-ultra|off|default>` — "
-            "set the caveman skill level for this channel (also `!caveman`, no arg shows current)\n\n"
+            "set the caveman skill level for this channel (also `!caveman`, no arg shows current)\n"
+            "`/ponytail <lite|full|ultra|off|default>` — "
+            "set the ponytail code-minimalism level for this channel (also `!ponytail`)\n\n"
             "**Running a task**\n"
             f"Just type your task. {project_help}"
             "**Sessions**\n"
@@ -1141,6 +1248,11 @@ async def on_message(message: discord.Message):
     m = re.match(r'^[!/]?caveman(?:\s+(\S+))?$', text, re.IGNORECASE)
     if m:
         await message.reply(set_caveman(state, m.group(1)))
+        return
+
+    m = re.match(r'^[!/]?ponytail(?:\s+(\S+))?$', text, re.IGNORECASE)
+    if m:
+        await message.reply(set_ponytail(state, m.group(1)))
         return
 
     m = re.match(r'^!?model(?:\s+(\S+))?$', text, re.IGNORECASE)
