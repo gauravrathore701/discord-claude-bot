@@ -26,7 +26,10 @@ ALLOWED_IDS  = {int(uid.strip()) for uid in os.environ["DISCORD_ALLOWED_IDS"].sp
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", "/home/gaurav/Projects")
 CLAUDE_BIN   = os.environ.get("CLAUDE_BIN", "/home/gaurav/.local/bin/claude")
 TIMEOUT      = int(os.environ.get("TASK_TIMEOUT", "1200"))  # seconds
-PING_INTERVAL = 120  # seconds between "still working" edits
+PING_INTERVAL = 30   # max seconds between status edits when no new step arrives
+STEP_INTERVAL = 3    # seconds between live-step checks; keeps edits well under Discord's rate limit
+STEP_LINES    = 6    # recent steps shown in the status message
+STEP_WIDTH    = 70   # chars per step line
 
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_ROOT   = os.path.join(BASE_DIR, ".claude", "sessions")
@@ -243,6 +246,7 @@ class ChannelState:
     ponytail: str | None = None     # None => PONYTAIL_LEVEL default from .env
     active_proc: asyncio.subprocess.Process | None = None
     active_task: asyncio.Task | None = None
+    steps: list = field(default_factory=list)  # live step lines of the running task
 
 
 def parse_timeout(entry: dict) -> int | None:
@@ -694,6 +698,31 @@ def resolve_dir(cfg: ChannelConfig, content: str) -> tuple[str, str]:
     return base_dir, content
 
 
+def describe_event(ev: dict) -> list[str]:
+    """One short status line per tool call / text / thinking block in a stream-json assistant event."""
+    if ev.get("type") != "assistant":
+        return []
+    lines = []
+    for item in (ev.get("message") or {}).get("content") or []:
+        kind = item.get("type")
+        if kind == "tool_use":
+            inp = item.get("input") or {}
+            what = (inp.get("description")
+                    or (inp.get("file_path") and os.path.basename(inp["file_path"]))
+                    or inp.get("pattern") or inp.get("command") or "")
+            line = f"{item.get('name', '?')}: {what}"
+        elif kind == "text":
+            line = "💬 " + item.get("text", "")
+        elif kind == "thinking":
+            if not item.get("thinking", "").strip():
+                continue  # this CLI sends thinking blocks with the text omitted; an empty 💭 is noise
+            line = "💭 " + item["thinking"]
+        else:
+            continue
+        lines.append(" ".join(line.split())[:STEP_WIDTH])
+    return lines
+
+
 async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: str) -> str:
     # Bridge previous day context into the first message of a new session.
     # Normally daily_rollover_loop() already generated this at 06:30; fall back to a
@@ -722,7 +751,8 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         build_points_block(cfg, cwd)
     )
 
-    cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "--output-format", "json"]
+    cmd = [CLAUDE_BIN, "--dangerously-skip-permissions",
+           "--output-format", "stream-json", "--verbose"]
     prompt = "\n\n".join(p for p in (
         caveman_prompt(state.caveman or CAVEMAN_LEVEL),
         ponytail_prompt(state.ponytail or PONYTAIL_LEVEL),
@@ -741,37 +771,51 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
         env={**os.environ, "TERM": "dumb"},
+        limit=32 * 1024 * 1024,  # one stream-json line can carry a whole tool result
     )
     state.active_proc = proc
+    state.steps = []
     limit = channel_timeout(cfg)
+    result, junk = None, []
+    err_task = asyncio.create_task(proc.stderr.read())  # drain so a full pipe can't stall the CLI
+
+    async def pump():
+        nonlocal result
+        async for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                junk.append(line.decode(errors="replace"))
+                continue
+            if ev.get("type") == "result":
+                result = ev
+            else:
+                state.steps.extend(describe_event(ev))
+        await proc.wait()
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=limit)
+        await asyncio.wait_for(pump(), timeout=limit)
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.communicate()
+        await proc.wait()
         return f"Timed out after {limit}s ({fmt_secs(limit)}, {cfg.name} channel limit)."
     finally:
         state.active_proc = None
 
-    raw = stdout.decode(errors="replace").strip()
-    err = stderr.decode(errors="replace").strip()
+    err = (await err_task).decode(errors="replace").strip()
 
-    out = raw
-    try:
-        data = json.loads(raw)
-        out = data.get("result", raw)
-        if data.get("is_error"):
-            out = f"[error] {out}"
-        new_sid = data.get("session_id")
-        if new_sid:
-            now = time.time()
-            if not state.session_id:
-                state.session_start = now
-            state.session_id = new_sid
-            state.session_last_used = now
-            save_session(state)
-    except (json.JSONDecodeError, AttributeError):
-        pass
+    data = result or {}
+    out = data.get("result") or "".join(junk).strip()
+    if data.get("is_error"):
+        out = f"[error] {out}"
+    new_sid = data.get("session_id")
+    if new_sid:
+        now = time.time()
+        if not state.session_id:
+            state.session_start = now
+        state.session_id = new_sid
+        state.session_last_used = now
+        save_session(state)
 
     if err:
         out += f"\n\n[stderr]\n{err}"
@@ -781,15 +825,21 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     return final_out
 
 
-async def progress_ping(status_msg: discord.Message, cwd: str):
-    """Edit the status message every PING_INTERVAL seconds to show elapsed time."""
-    start = time.time()
+async def progress_ping(status_msg: discord.Message, state: ChannelState):
+    """Edit the status message with elapsed time and the last STEP_LINES live steps.
+    Checks every STEP_INTERVAL s; edits only on a new step or after PING_INTERVAL s."""
+    start = last_edit = time.time()
+    seen = 0
     try:
         while True:
-            await asyncio.sleep(PING_INTERVAL)
-            elapsed = int(time.time() - start)
-            m, s = divmod(elapsed, 60)
-            await status_msg.edit(content=f"Working in `{cwd}`... ({m}m{s:02d}s elapsed)")
+            await asyncio.sleep(STEP_INTERVAL)
+            now = time.time()
+            if len(state.steps) == seen and now - last_edit < PING_INTERVAL:
+                continue
+            seen, last_edit = len(state.steps), now
+            m, s = divmod(int(now - start), 60)
+            recent = [discord.utils.escape_markdown(l) for l in state.steps[-STEP_LINES:]]
+            await status_msg.edit(content="\n".join([f"⏳ {m}m{s:02d}s", *recent]))
     except (asyncio.CancelledError, discord.NotFound, discord.HTTPException):
         pass
 
@@ -1354,11 +1404,12 @@ async def on_message(message: discord.Message):
     slack_source = (message.author.display_name or "webhook") if is_webhook \
         else (message.author.display_name or "Gaurav")
 
-    ack = "Ack — webhook request received. Working in" if is_webhook else "Working in"
-    status = await message.reply(f"{ack} `{cwd}`...")
+    ack = "Ack — webhook request received. " if is_webhook else ""
+    status = await message.reply(f"{ack}⏳ thinking…")
 
     async def do_task():
-        ping = asyncio.create_task(progress_ping(status, cwd))
+        state.steps = []  # don't flash the previous task's steps before run_claude resets them
+        ping = asyncio.create_task(progress_ping(status, state))
         try:
             async with message.channel.typing():
                 output = await run_claude(cfg, state, task, cwd)
