@@ -1174,7 +1174,8 @@ async def on_ready():
               flush=True)
     else:
         ip = await lan_ip()
-        ssh = f"```\nssh gaurav@{ip}\n```" if ip else "IP lookup failed — try `raspberrypi.local`."
+        ssh = (f"```\nssh gaurav@{ip}\n```\nShows on LAN: http://{ip}:4180" if ip
+               else "IP lookup failed — try `raspberrypi.local`.")
         await ch.send(f"**Claudy Rex online.**\n{ssh}")
 
 
