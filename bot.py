@@ -248,6 +248,8 @@ class ChannelState:
     ponytail: str | None = None     # None => PONYTAIL_LEVEL default from .env
     active_proc: asyncio.subprocess.Process | None = None
     active_task: asyncio.Task | None = None
+    active_stdin: asyncio.StreamWriter | None = None  # open while the running task still takes mid-task messages
+    injected: list = field(default_factory=list)       # messages added to the running task, for chat history
     steps: list = field(default_factory=list)  # live step lines of the running task
 
 
@@ -725,6 +727,11 @@ def describe_event(ev: dict) -> list[str]:
     return lines
 
 
+def user_msg(text: str) -> bytes:
+    """One stream-json input line (claude -p --input-format stream-json)."""
+    return (json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n").encode()
+
+
 def kill_tree(proc):
     """Kill the CLI and everything it spawned. A plain kill leaves tool children holding the
     stdout pipe, and asyncio's proc.wait() then blocks until they exit on their own."""
@@ -774,10 +781,14 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         cmd += ["--model", state.model]
     if session_active(state):
         cmd += ["--resume", state.session_id]
-    cmd += ["-p", task_with_ctx]
+    # Prompt goes in on stdin as stream-json, and stdin stays open while the task runs, so a
+    # message Gaurav sends mid-task is fed to the same session (the CLI picks it up at the next
+    # tool boundary — tested 2026-10-20). stdin is closed on the first result, which ends the run.
+    cmd += ["-p", "--input-format", "stream-json"]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
@@ -787,13 +798,20 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     )
     state.active_proc = proc
     state.steps = []
+    state.injected = []
+    try:
+        proc.stdin.write(user_msg(task_with_ctx))
+        await proc.stdin.drain()
+        state.active_stdin = proc.stdin
+    except (BrokenPipeError, ConnectionResetError):
+        pass   # CLI died on startup; pump() below collects its error output
     limit = channel_timeout(cfg)
-    result, junk = None, []
+    results, junk = [], []
     last_event = time.monotonic()
     err_task = asyncio.create_task(proc.stderr.read())  # drain so a full pipe can't stall the CLI
 
     async def pump():
-        nonlocal result, last_event
+        nonlocal last_event
         async for line in proc.stdout:
             last_event = time.monotonic()
             try:
@@ -802,7 +820,11 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
                 junk.append(line.decode(errors="replace"))
                 continue
             if ev.get("type") == "result":
-                result = ev
+                # a message injected during the final answer can start a 2nd turn; keep every result
+                results.append(ev)
+                if state.active_stdin:
+                    state.active_stdin = None
+                    proc.stdin.close()
             else:
                 state.steps.extend(describe_event(ev))
         await proc.wait()
@@ -828,11 +850,12 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
             pump_t.cancel()
             kill_tree(proc)
         state.active_proc = None
+        state.active_stdin = None
 
     err = (await err_task).decode(errors="replace").strip()
 
-    data = result or {}
-    out = data.get("result") or "".join(junk).strip()
+    data = results[-1] if results else {}
+    out = "\n\n".join(r["result"] for r in results if r.get("result")) or "".join(junk).strip()
     if data.get("is_error"):
         out = f"[error] {out}"
     new_sid = data.get("session_id")
@@ -848,7 +871,8 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         out += f"\n\n[stderr]\n{err}"
 
     final_out = out or "(no output)"
-    append_chat_history(state, task, final_out)
+    history_task = task + "".join(f"\n\n[added mid-task] {m}" for m in state.injected)
+    append_chat_history(state, history_task, final_out)
     return final_out
 
 
@@ -1379,6 +1403,17 @@ async def on_message(message: discord.Message):
 
     # ── reject concurrent tasks (per channel) ────────────────────────────────
     if state.active_task and not state.active_task.done():
+        # Gaurav correcting a running task ("NAS, not NASA") → feed it into the same session.
+        # Webhook callers and attachments still get the old answer.
+        if state.active_stdin and text and not is_webhook and not image_attachments and not file_attachments:
+            try:
+                state.active_stdin.write(user_msg(f"[Gaurav, mid-task] {text}"))
+                await state.active_stdin.drain()
+                state.injected.append(text)
+                await message.add_reaction("↪️")
+                return
+            except (ConnectionResetError, BrokenPipeError):
+                pass   # task finished between the check and the write
         await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
         return
 
