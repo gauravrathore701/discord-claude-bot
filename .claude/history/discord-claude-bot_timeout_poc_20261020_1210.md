@@ -16,3 +16,4 @@
 - .env: TASK_TIMEOUT 600 → 10800, + TASK_IDLE_TIMEOUT=900 (backup .env.bak-20261020). Per-channel caps unchanged (zh/blog/finance 25m, pi-ops/daily-tasks 10m, animation 3h).
 - Tested with fake CLI: chatty finishes; silent killed at idle (15s poll); cap hit; cancel leaves no children.
 - Backup bot.py.bak-20261020. NOT restarted yet — waiting for Gaurav's yes.
+- 12:06 restart queued via systemd-run timer (Gaurav: yes)

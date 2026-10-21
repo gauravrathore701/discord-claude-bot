@@ -4,3 +4,4 @@ Ask: correcting a running task ("NAS not NASA") got "Already running… !cancel"
 - bot.py: user_msg(); prompt now on stdin (no argv limit either); state.active_stdin/injected; stdin closed on first result;
   all result texts joined; on_message writes `[Gaurav, mid-task] text` + ↪️ reaction. Webhooks/attachments → old reply.
 - Resume across runs verified (code-word test). Backup bot.py.bak-20261020b. Restart pending Gaurav's yes.
+- 12:14 restart queued (Gaurav: yes)
