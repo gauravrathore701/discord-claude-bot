@@ -207,6 +207,11 @@ BASE_POINTS: dict[str, str] = {
         "- Keep the whole answer tight: aim well under 1900 characters. Past that it is split across "
         "messages, and a very long one is uploaded as answer.md, which is the worst thing to read on a phone.\n"
         "- Lead with the answer in the first line. Cut preamble, restating of the question, and closing summaries.",
+    "send_files":
+        "SENDING IMAGES/FILES: to post an image (or any file) to Discord, put a line "
+        "`[[send: /absolute/path]]` in your answer, one per file. The bot strips the line and "
+        "uploads the file (max 10 MB each). Save generated images somewhere that outlives the "
+        "task (not a temp file you delete).",
     "skills":
         "SKILLS: the SKILLS INDEX at the end of this block lists every skill this channel can use — "
         "shared ones in `~/.claude/skills/` (all channels) and this project's `.claude/skills/`. "
@@ -996,6 +1001,31 @@ def split_for_discord(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
     return chunks or [""]
 
 
+SEND_RE = re.compile(r"^[ \t]*\[\[send:\s*(.+?)\s*\]\][ \t]*$\n?", re.M)
+UPLOAD_MAX = 10 * 1024 * 1024  # Discord's upload cap for bots in unboosted servers
+
+
+def extract_sends(text: str) -> tuple[str, list[str]]:
+    """Pull `[[send: /abs/path]]` lines out of an answer -> (text, paths)."""
+    return SEND_RE.sub("", text), SEND_RE.findall(text)
+
+
+async def send_files(channel, paths: list[str]):
+    """Upload files Claude asked to send, 10 per message (Discord's cap)."""
+    ok, bad = [], []
+    for p in paths:
+        p = os.path.expanduser(p)
+        if os.path.isfile(p) and os.path.getsize(p) <= UPLOAD_MAX:
+            ok.append(p)
+        else:
+            bad.append(p)
+    for i in range(0, len(ok), 10):
+        await channel.send(files=[discord.File(p) for p in ok[i:i + 10]])
+    if bad:
+        await channel.send("⚠️ couldn't send (missing or >10 MB):\n"
+                           + "\n".join(f"`{p}`" for p in bad))
+
+
 async def send_long(channel, text: str, reply_to=None):
     """Post the answer as markdown Discord can render. Too long for a handful of
     messages -> first chunk inline + the whole thing attached as answer.md."""
@@ -1482,8 +1512,10 @@ async def on_message(message: discord.Message):
                 await status.delete()
             except discord.NotFound:
                 pass
+            output, sends = extract_sends(output)
             shown, lists = checklist.extract_blocks(output)
-            await send_long(message.channel, shown or "(checklist below)", reply_to=message)
+            await send_long(message.channel, shown or "(attached below)", reply_to=message)
+            await send_files(message.channel, sends)
             for title, items in lists:
                 await checklist.post(message.channel, checklist.new_adhoc(title, items))
             await relay_to_slack(cfg, text, output, slack_source)
