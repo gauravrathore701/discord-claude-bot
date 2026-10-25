@@ -796,7 +796,49 @@ async def quote_prefix(message: discord.Message) -> str:
     if len(body) > 800:
         body = body[:800] + "…"
     lead = "Replying to your message" if quoted.author == client.user else "Replying to"
-    return f"[{lead}: «{body}»]\n"
+    out = f"[{lead}: «{body}»]\n"
+    # the quoted message's own images/files, downloaded the same way as a new message's
+    notes = attachment_notes(*await save_attachments(quoted.attachments))
+    if notes:
+        out += f"[Attachments on the quoted message:]\n{notes}\n"
+    return out
+
+
+def split_attachments(attachments) -> tuple[list, list]:
+    """(images, other files) — the split every incoming message gets."""
+    images = [a for a in attachments if a.content_type and a.content_type.startswith("image/")]
+    return images, [a for a in attachments if a not in images]
+
+
+async def save_attachments(attachments) -> tuple[list, list]:
+    """Download Discord attachments to /tmp -> (image_paths, [(filename, path), ...])."""
+    images, files = split_attachments(attachments)
+    image_paths = []
+    for attachment in images:
+        ext = attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else "png"
+        if ext not in ("png", "jpg", "jpeg", "gif", "webp"):
+            ext = "png"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}", prefix="discord_img_")
+        tmp.close()
+        await attachment.save(tmp.name)
+        image_paths.append(tmp.name)
+    file_paths = []
+    for attachment in files:
+        fname = attachment.filename
+        suffix = f"_{fname}" if fname else ""
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="discord_file_")
+        tmp.close()
+        await attachment.save(tmp.name)
+        file_paths.append((fname, tmp.name))
+    return image_paths, file_paths
+
+
+def attachment_notes(image_paths, file_paths) -> str:
+    """The lines that tell Claude where each downloaded attachment is."""
+    return "\n".join(
+        [f"[Image attached — read this file with your Read tool: {p}]" for p in image_paths]
+        + [f"[File attached: '{name}' — read it with your Read tool at path: {path}]"
+           for name, path in file_paths])
 
 
 def kill_tree(proc):
@@ -1389,14 +1431,7 @@ async def on_message(message: discord.Message):
             text, re.IGNORECASE):
         await message.reply("Webhook callers can send questions only, not bot commands.")
         return
-    image_attachments = [
-        a for a in message.attachments
-        if a.content_type and a.content_type.startswith("image/")
-    ]
-    file_attachments = [
-        a for a in message.attachments
-        if a not in image_attachments
-    ]
+    image_attachments, file_attachments = split_attachments(message.attachments)
 
     if not text and not image_attachments and not file_attachments:
         return
@@ -1532,51 +1567,42 @@ async def on_message(message: discord.Message):
     quote = await quote_prefix(message) if not is_webhook else ""
 
     # ── busy channel: inject, queue, or reject (per channel) ─────────────────
-    if state.active_task and not state.active_task.done():
+    busy = state.active_task and not state.active_task.done()
+    if busy and (is_webhook or (not state.active_stdin and state.queued)):
+        await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
+        return
+
+    # ── download image/file attachments to temp files ────────────────────────
+    image_paths, file_paths = await save_attachments(message.attachments)
+
+    if busy:
         # Gaurav correcting a running task ("NAS, not NASA"), or talking to it while its background
-        # work is still pending → feed it into the same session. Attachments and webhooks can't be.
-        if state.active_stdin and text and not is_webhook and not image_attachments and not file_attachments:
+        # work is still pending → feed it (text + attachments) into the same session. Webhooks can't.
+        if state.active_stdin:
             label = "[Gaurav]" if state.main_done else "[Gaurav, mid-task]"
+            notes = attachment_notes(image_paths, file_paths)
+            body = text or ("(sent an attachment — read it and respond)" if notes else "")
+            injected = f"{quote}{body}" + (f"\n\n{notes}" if notes else "")
             try:
-                state.active_stdin.write(user_msg(f"{label} {quote}{text}"))
+                state.active_stdin.write(user_msg(f"{label} {injected}"))
                 await state.active_stdin.drain()
-                state.injected.append(quote + text)
+                state.injected.append(injected)
                 state.reply_to = message   # the turn this starts answers this message
                 await message.add_reaction("↪️")
                 return
             except (ConnectionResetError, BrokenPipeError, AttributeError):
                 pass   # stdin closed between the check and the write -> queue below
-        elif is_webhook or state.active_stdin or state.queued:
-            await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
-            return
-        # stdin is closed: the task is winding down. Run this message as the next task once it exits.
+            if state.queued:
+                await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
+                return
+        # stdin is closed: the task is winding down. Run this message as the next task once it exits
+        # (attachments are already on disk, so they ride along).
         state.queued = True
         try:
             await message.add_reaction("⏳")
             await asyncio.wait({state.active_task})
         finally:
             state.queued = False
-
-    # ── download image attachments to temp files ─────────────────────────────
-    image_paths = []
-    for attachment in image_attachments:
-        ext = attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else "png"
-        if ext not in ("png", "jpg", "jpeg", "gif", "webp"):
-            ext = "png"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}", prefix="discord_img_")
-        tmp.close()
-        await attachment.save(tmp.name)
-        image_paths.append(tmp.name)
-
-    # ── download file attachments to temp files ───────────────────────────────
-    file_paths = []
-    for attachment in file_attachments:
-        fname = attachment.filename
-        suffix = f"_{fname}" if fname else ""
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="discord_file_")
-        tmp.close()
-        await attachment.save(tmp.name)
-        file_paths.append((fname, tmp.name))
 
     # ── dispatch task ────────────────────────────────────────────────────────
     cwd, task = resolve_dir(cfg, text)

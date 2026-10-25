@@ -30,3 +30,15 @@ Gaurav asked for three changes to the Discord -> Claude bridge (`bot.py`).
   message -> posts STARTED, BANANA, FINISHED, exit at 31s, remainder empty.
 
 Backup: `bot.py.bak-20261025b`. Service NOT restarted (needs Gaurav's go-ahead).
+
+## 4. Follow-up: attachments in quotes and mid-task (2026-10-25)
+- New helpers `split_attachments()` / `save_attachments()` / `attachment_notes()` — the existing
+  new-task download code, factored out; the new-task path uses them unchanged.
+- `quote_prefix()` now downloads the quoted message's images/files and adds
+  `[Attachments on the quoted message:]` + the usual `[Image attached …]` / `[File attached …]` lines.
+- Busy channel: messages with images/files are injected into stdin (text + attachment lines; an
+  attachment-only message becomes `(sent an attachment — read it and respond)`). Webhooks still rejected.
+  Attachments are downloaded before the inject/queue split, so the queued-next-task path keeps them.
+- Tests: py_compile OK, `check_bg_tracker.py` OK, offline fake-object check of `quote_prefix`,
+  `save_attachments`, and `on_message` injection (image-only, quote+file, webhook reject, queued reject).
+- Backup: `bot.py.bak-20261025c`. Service NOT restarted.
