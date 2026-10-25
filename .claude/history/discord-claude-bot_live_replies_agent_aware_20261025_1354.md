@@ -42,3 +42,20 @@ Backup: `bot.py.bak-20261025b`. Service NOT restarted (needs Gaurav's go-ahead).
 - Tests: py_compile OK, `check_bg_tracker.py` OK, offline fake-object check of `quote_prefix`,
   `save_attachments`, and `on_message` injection (image-only, quote+file, webhook reject, queued reject).
 - Backup: `bot.py.bak-20261025c`. Service NOT restarted.
+
+## 5. Follow-up: `!cancel` is the only task terminator (2026-10-25)
+Gaurav: "remove that idle timeout only cancel command should be a single way to terminate a task".
+- `run_claude()`: `idle_watch()` + `asyncio.wait(..., timeout=limit)` removed, with the
+  "Stopped: no activity…" / "Timed out after…" returns. Now `await asyncio.wait({pump_t})` — runs until
+  the CLI exits. `asyncio.wait` (not `await pump_t`) so a `!cancel` leaves pump_t undone and the
+  `finally` still `kill_tree()`s the process group.
+- The 60s stdin safety valve stays as `stdin_valve()` — it only closes stdin (CLI exits by itself), never kills.
+- Removed `TIMEOUT`, `IDLE_TIMEOUT`, `ChannelConfig.timeout`, `parse_timeout()`, `channel_timeout()`,
+  `fmt_secs()`; `timeout_minutes` dropped from `.claude/channels.json`; `TASK_*TIMEOUT` dropped from
+  README/.env.example (`.env` lines left, now ignored). `!status` says "No timeout"; startup log lists (id, name).
+- Other kill paths checked: systemd unit has no RuntimeMaxSec/WatchdogSec/TimeoutSec; `watchdog.sh`
+  restarts the unit only on stale heartbeat/DNS ladder (bot health — kills tasks only as a side
+  effect of the restart, left alone); daily rollover skips a channel with an active task; no cron kills.
+- Tests: py_compile OK, `check_bg_tracker.py` OK; fake-CLI harness: silent 3s run posts its result and
+  exits normally; 600s run cancelled after 2s -> CancelledError, process group gone.
+- Backup: `bot.py.bak-20261025d`. Service NOT restarted.

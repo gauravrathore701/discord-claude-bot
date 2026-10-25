@@ -25,9 +25,7 @@ CHANNEL_ID   = int(os.environ["DISCORD_CHANNEL_ID"])
 ALLOWED_IDS  = {int(uid.strip()) for uid in os.environ["DISCORD_ALLOWED_IDS"].split(",")}
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", "/home/gaurav/Projects")
 CLAUDE_BIN   = os.environ.get("CLAUDE_BIN", "/home/gaurav/.local/bin/claude")
-TIMEOUT      = int(os.environ.get("TASK_TIMEOUT", "10800"))  # hard cap, seconds; a channel can override
-# Killed only after this long with no stream event. One Bash call can run 10 min silently, so stay above that.
-IDLE_TIMEOUT = int(os.environ.get("TASK_IDLE_TIMEOUT", "900"))
+# No task timeout: a task runs until the CLI exits on its own or Gaurav sends !cancel (2026-10-25).
 PING_INTERVAL = 30   # max seconds between status edits when no new step arrives
 STEP_INTERVAL = 3    # seconds between live-step checks; keeps edits well under Discord's rate limit
 STEP_LINES    = 6    # recent steps shown in the status message
@@ -150,7 +148,6 @@ class ChannelConfig:
     notes: list[str]            # extra "important points" bullets for this channel
     omit: list[str] = field(default_factory=list)   # BASE_POINTS keys to drop here
     replace_points: bool = False  # True => use only `notes`, skip BASE_POINTS entirely
-    timeout: int | None = None    # per-channel task timeout, seconds; None => TASK_TIMEOUT
     webhooks: set[int] = field(default_factory=set)  # webhook ids allowed to task here
     webhooks_any: bool = False    # True => any webhook in this channel may task
     slack_webhook: str | None = None  # relay target for webhook-sourced answers
@@ -261,32 +258,6 @@ class ChannelState:
     steps: list = field(default_factory=list)  # live step lines of the running task
 
 
-def parse_timeout(entry: dict) -> int | None:
-    """Per-channel task timeout from a channels.json entry. Accepts
-    "timeout_minutes": 25, "timeout": 1500, or "timeout": "25m" / "90s".
-    Returns seconds, or None to fall back to TASK_TIMEOUT."""
-    if entry.get("timeout_minutes") is not None:
-        return max(1, int(float(entry["timeout_minutes"]) * 60))
-    raw = entry.get("timeout")
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        raw = raw.strip().lower()
-        if raw.endswith("m"):
-            return max(1, int(float(raw[:-1]) * 60))
-        raw = raw[:-1] if raw.endswith("s") else raw
-    return max(1, int(float(raw)))
-
-
-def fmt_secs(secs: int) -> str:
-    m, s = divmod(int(secs), 60)
-    return f"{m}m{s:02d}s" if s else f"{m}m"
-
-
-def channel_timeout(cfg: ChannelConfig) -> int:
-    return cfg.timeout or TIMEOUT
-
-
 def load_channels() -> dict[int, ChannelConfig]:
     """Load channel configs from .claude/channels.json. The entry with
     id "__DEFAULT__" is bound to DISCORD_CHANNEL_ID from .env so the original
@@ -313,7 +284,6 @@ def load_channels() -> dict[int, ChannelConfig]:
             notes=list(notes) if isinstance(notes, list) else [notes],
             omit=entry.get("omit", []),
             replace_points=entry.get("replace_points", False),
-            timeout=parse_timeout(entry),
             webhooks={int(h) for h in hooks if str(h).isdigit()},
             webhooks_any=hooks_any,
             # the Slack URL itself carries a token, so channels.json only names the
@@ -852,7 +822,8 @@ def kill_tree(proc):
 
 async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: str, post=None) -> str:
     """Run one task. Each `result` (one per turn) is handed to `post(text)` as soon as it arrives;
-    returns only what is still unposted at exit (timeout/stderr/no output), "" if nothing is."""
+    returns only what is still unposted at exit (stderr/no output), "" if nothing is.
+    No timeout: it runs until the CLI exits or !cancel cancels the awaiting task."""
     # Bridge previous day context into the first message of a new session.
     # Normally daily_rollover_loop() already generated this at 06:30; fall back to a
     # lazy fetch here only if the bot was offline at rollover time and it never ran.
@@ -918,7 +889,6 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         state.active_stdin = proc.stdin
     except (BrokenPipeError, ConnectionResetError):
         pass   # CLI died on startup; pump() below collects its error output
-    limit = channel_timeout(cfg)
     results, junk, unposted = [], [], []
     bg = BgTracker()
     last_event = time.monotonic()
@@ -960,33 +930,21 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
                 state.steps.extend(describe_event(ev))
         await proc.wait()
 
-    async def idle_watch():
-        # Pending background work counts as activity (hard cap still applies). With nothing pending,
-        # a stdin left open after a result is closed after 60s quiet so the CLI can exit.
+    async def stdin_valve():
+        # Never kills. With nothing pending, a stdin left open after a result is closed after
+        # 60s quiet so the CLI can exit on its own.
         while True:
             await asyncio.sleep(15)
-            quiet = time.monotonic() - last_event
-            if bg.pending:
-                continue
-            if results and quiet > 60:
+            if not bg.pending and results and time.monotonic() - last_event > 60:
                 close_stdin()
-            if quiet >= IDLE_TIMEOUT:
-                return
 
-    # A task that keeps producing events (or has background work pending) runs until the hard cap;
-    # a silent one dies after IDLE_TIMEOUT.
-    pump_t, idle_t = asyncio.create_task(pump()), asyncio.create_task(idle_watch())
+    # No timeout: wait for the CLI to exit. The only kill is !cancel (CancelledError below).
+    pump_t, valve_t = asyncio.create_task(pump()), asyncio.create_task(stdin_valve())
     try:
-        await asyncio.wait({pump_t, idle_t}, timeout=limit, return_when=asyncio.FIRST_COMPLETED)
-        if not pump_t.done():
-            kill_tree(proc)
-            await proc.wait()
-            if idle_t.done():
-                return f"Stopped: no activity for {fmt_secs(IDLE_TIMEOUT)} (idle limit)."
-            return f"Timed out after {limit}s ({fmt_secs(limit)}, {cfg.name} channel hard cap)."
-        pump_t.result()   # re-raise a pump error, as wait_for did
+        await asyncio.wait({pump_t})   # not `await pump_t`: a cancel must leave pump_t running so
+        pump_t.result()                # finally sees it undone and kill_tree()s; re-raises pump errors
     finally:
-        idle_t.cancel()
+        valve_t.cancel()
         if not pump_t.done():   # !cancel lands here as CancelledError
             pump_t.cancel()
             kill_tree(proc)
@@ -1351,9 +1309,7 @@ async def on_ready():
         load_caveman(state)
         load_ponytail(state)
     print(f"Online as {client.user}", flush=True)
-    print(f"Configured channels: "
-          f"{[(cid, cfg.name, fmt_secs(channel_timeout(cfg))) for cid, cfg in CHANNELS.items()]}",
-          flush=True)
+    print(f"Configured channels: {[(cid, cfg.name) for cid, cfg in CHANNELS.items()]}", flush=True)
     dflt = caveman_prompt(CAVEMAN_LEVEL)
     print(f"caveman default: {CAVEMAN_LEVEL} ({len(dflt)} chars from {CAVEMAN_SKILL_FILE})"
           if dflt else f"caveman default: {CAVEMAN_LEVEL} (no skill text loaded)", flush=True)
@@ -1556,12 +1512,9 @@ async def on_message(message: discord.Message):
 
     if text.lower() == "!status":
         running = state.active_task and not state.active_task.done()
-        limit = channel_timeout(cfg)
-        src = "channel" if cfg.timeout else "default"
         await message.reply(
             ("A task is running." if running else "Idle.")
-            + f"\nTimeout: `{fmt_secs(limit)}` hard cap ({limit}s, {src}), "
-            + f"`{fmt_secs(IDLE_TIMEOUT)}` idle")
+            + "\nNo timeout — a task runs until it finishes or `!cancel`.")
         return
 
     quote = await quote_prefix(message) if not is_webhook else ""
@@ -1668,7 +1621,7 @@ async def on_message(message: discord.Message):
         try:
             async with message.channel.typing():
                 output = await run_claude(cfg, state, task, cwd, post)
-            if output:      # whatever wasn't posted live (timeout, stderr, no output)
+            if output:      # whatever wasn't posted live (stderr, no output)
                 await post(output)
             await drop_status()
         except asyncio.CancelledError:

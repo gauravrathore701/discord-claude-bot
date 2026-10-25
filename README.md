@@ -38,8 +38,6 @@ DISCORD_CHANNEL_ID=<channel id>
 DISCORD_ALLOWED_IDS=<user1_id>,<user2_id>
 PROJECTS_DIR=/home/gaurav/Projects
 CLAUDE_BIN=/home/gaurav/.local/bin/claude
-TASK_TIMEOUT=10800
-TASK_IDLE_TIMEOUT=900
 ```
 
 ## Running

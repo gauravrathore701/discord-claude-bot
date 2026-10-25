@@ -25,7 +25,6 @@
     "name": "zh-ai-support",
     "root_dir": "/home/gaurav/Projects/zh-ai-support",
     "project_routing": false,
-    "timeout_minutes": 25,
     "notes": [
       "This channel is grounded in the zh-ai-support project at /home/gaurav/Projects/zh-ai-support (ZentrumHub support/ops toolkit: Elasticsearch log analysis, booking APIs, Stripe reconciliation, PostHog analytics). Every message runs there — read its code, configs and .claude/docs before answering, and keep work inside that folder.",
       "Create new scripts for a action which can't be performed by existing script.",
@@ -51,7 +50,6 @@
     "name": "blog",
     "root_dir": "/home/gaurav/Projects/bloging-app",
     "project_routing": false,
-    "timeout_minutes": 25,
     "notes": [
       "This channel is grounded in the blog project at /home/gaurav/Projects/bloging-app (Astro static blog published at cursedshrine.com/blog). Every message runs there. READ /home/gaurav/Projects/bloging-app/.claude/CONTEXT-HANDOFF.md AT THE START OF EVERY NEW SESSION — it carries the full state of the project: pipeline stage, what is researched, what is drafted, what is live, and the open questions.",
       "WRITING STYLE IN THIS CHANNEL — NOT CAVEMAN. Write normal, complete prose. Moderately detailed: explain the reasoning, the trade-offs and the evidence behind a recommendation, not just the conclusion. Do not pad, do not repeat yourself, and do not write an essay when three sentences settle it. Aim for a few short structured sections. Still obey the phone-formatting rules (narrow code blocks, no markdown tables, bold labels over headers).",
@@ -69,7 +67,6 @@
     "name": "pi-ops",
     "root_dir": "/home/gaurav",
     "project_routing": false,
-    "timeout_minutes": 10,
     "notes": [
       "OPS CHANNEL. This channel exists to run commands on the Pi, not to have conversations. The `!` commands (`!usage`, `!ip`, `!reboot`, `!remind`) are handled natively by the bot with no Claude call at all — never re-implement them, never answer them yourself, and never explain them unless asked. Type `!ops` for the list.",
       "MODEL: haiku, deliberately. Keep every reply short and factual — a few lines. No preamble, no reasoning shown, no suggestions unless asked. If a request needs real analysis, say so and point Gaurav at another channel rather than doing it here.",
@@ -83,7 +80,6 @@
     "name": "finance",
     "root_dir": "/home/gaurav/Documents/ObsidianVault/Finance",
     "project_routing": false,
-    "timeout_minutes": 25,
     "omit": [
       "history"
     ],
@@ -102,7 +98,6 @@
     "name": "animation",
     "root_dir": "/home/gaurav/Projects/Animations",
     "project_routing": false,
-    "timeout_minutes": 180,
     "notes": [
       "ANIMATION CHANNEL (#rex-animation). Blender modelling/animation on the Pi via the `blender` MCP server. Read `/home/gaurav/Projects/Animations/CLAUDE.md` first every task — it has the Pi/Blender setup, workflow and layout. Check `.claude/skills/` for an existing skill before working something out from scratch, and follow it.",
       "START BLENDER FIRST: before any mcp__blender__ call, check `ss -ltn | grep ':9876 '`; if down run `/home/gaurav/Projects/.claude/tools/blender-mcp/start-blender.sh` (skill: blender-session). Cycles CPU with use_denoising=False is the default engine; never render long jobs through MCP — save the .blend and render headless (skill: blender-render-publish), detached via `systemd-run --user` when over ~5 min.",
@@ -117,7 +112,6 @@
     "name": "daily-tasks",
     "root_dir": "/home/gaurav/Documents/ObsidianVault",
     "project_routing": false,
-    "timeout_minutes": 10,
     "notes": [
       "TASKS-ONLY CHANNEL. This channel is for Gaurav's daily task list and nothing else. The 07:00 list is posted here, and its tick buttons edit that same message. Keep every reply to a couple of short lines — no analysis, no code, no long explanations. If he asks something unrelated to tasks, answer in one line and point him to #rex-chat.",
       "ALWAYS use the `discord-checklist` skill (~/.claude/skills/discord-checklist/SKILL.md) here. Read it before touching any list. The source of truth is the `## Tasks` section of today's Obsidian daily note at /home/gaurav/Documents/ObsidianVault/DailyNotes/MMM DD, YYYY.md. Recurring items live in DailyNotes/Recurring Tasks.md.",
