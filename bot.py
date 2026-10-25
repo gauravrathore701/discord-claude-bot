@@ -255,6 +255,9 @@ class ChannelState:
     active_task: asyncio.Task | None = None
     active_stdin: asyncio.StreamWriter | None = None  # open while the running task still takes mid-task messages
     injected: list = field(default_factory=list)       # messages added to the running task, for chat history
+    reply_to: object = None        # discord.Message the next result replies to (task msg or last injected one)
+    main_done: bool = False        # first result of the running task is in (later injections aren't "mid-task")
+    queued: bool = False           # a message is waiting for the winding-down task to exit
     steps: list = field(default_factory=list)  # live step lines of the running task
 
 
@@ -737,6 +740,65 @@ def user_msg(text: str) -> bytes:
     return (json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n").encode()
 
 
+class BgTracker:
+    """Background work (background Bash, background Agents, Monitors) the CLI still has running.
+    The CLI (2.x, checked 2026-10-25) emits `system` events: `background_tasks_changed` carries the
+    full list ({"tasks": [{"task_id": ...}, ...]}), plus `task_started` (is_backgrounded) and
+    `task_notification` (status completed/failed/killed/...). Once any of those is seen they are
+    authoritative; the tool-result text patterns are only a fallback for a CLI that lacks them."""
+    ADD_RES = [re.compile(p) for p in (
+        r"running in background with ID: (\w+)", r"agentId: (\w+)",
+        r"Monitor started \(task (\w+)", r'"resumedAgentId"\s*:\s*"(\w+)"')]
+    STOP_RE = re.compile(r"Successfully stopped task: (\w+)")
+    NOTIF_RE = re.compile(r"<task-id>(\w+)</task-id>.*?<status>(\w+)</status>", re.S)
+
+    def __init__(self):
+        self.pending: set[str] = set()
+        self.structured = False
+
+    def feed(self, ev: dict):
+        kind, sub = ev.get("type"), ev.get("subtype")
+        if kind == "system" and sub in ("background_tasks_changed", "task_started", "task_notification"):
+            self.structured = True
+            if sub == "background_tasks_changed":
+                self.pending = {t.get("task_id") for t in ev.get("tasks") or [] if t.get("task_id")}
+            elif sub == "task_started" and ev.get("is_backgrounded"):
+                self.pending.add(ev.get("task_id"))
+            elif sub == "task_notification" and ev.get("status") != "running":
+                self.pending.discard(ev.get("task_id"))
+            return
+        if self.structured or kind != "user":
+            return
+        content = (ev.get("message") or {}).get("content")
+        text = json.dumps(content) if not isinstance(content, str) else content
+        text = text.replace('\\"', '"')
+        for rx in self.ADD_RES:
+            self.pending.update(rx.findall(text))
+        for tid in self.STOP_RE.findall(text):
+            self.pending.discard(tid)
+        for tid, status in self.NOTIF_RE.findall(text):
+            if status != "running":
+                self.pending.discard(tid)
+
+
+async def quote_prefix(message: discord.Message) -> str:
+    """`[Replying to: «…»]` line for a Discord reply, so Claude sees what Gaurav is answering."""
+    ref = message.reference
+    if not ref or not ref.message_id or ref.type == discord.MessageReferenceType.forward:
+        return ""
+    quoted = ref.resolved if isinstance(ref.resolved, discord.Message) else None
+    if quoted is None:
+        try:
+            quoted = await message.channel.fetch_message(ref.message_id)
+        except discord.HTTPException:
+            return ""
+    body = (quoted.content or "").strip() or " ".join(f"(attachment: {a.filename})" for a in quoted.attachments)
+    if len(body) > 800:
+        body = body[:800] + "…"
+    lead = "Replying to your message" if quoted.author == client.user else "Replying to"
+    return f"[{lead}: «{body}»]\n"
+
+
 def kill_tree(proc):
     """Kill the CLI and everything it spawned. A plain kill leaves tool children holding the
     stdout pipe, and asyncio's proc.wait() then blocks until they exit on their own."""
@@ -746,7 +808,9 @@ def kill_tree(proc):
         pass
 
 
-async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: str) -> str:
+async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: str, post=None) -> str:
+    """Run one task. Each `result` (one per turn) is handed to `post(text)` as soon as it arrives;
+    returns only what is still unposted at exit (timeout/stderr/no output), "" if nothing is."""
     # Bridge previous day context into the first message of a new session.
     # Normally daily_rollover_loop() already generated this at 06:30; fall back to a
     # lazy fetch here only if the bot was offline at rollover time and it never ran.
@@ -788,7 +852,8 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
         cmd += ["--resume", state.session_id]
     # Prompt goes in on stdin as stream-json, and stdin stays open while the task runs, so a
     # message Gaurav sends mid-task is fed to the same session (the CLI picks it up at the next
-    # tool boundary — tested 2026-10-20). stdin is closed on the first result, which ends the run.
+    # tool boundary — tested 2026-10-20). stdin is closed on a result once no background work is
+    # pending, which ends the run; while work is pending it stays open for more messages.
     cmd += ["-p", "--input-format", "stream-json"]
 
     proc = await asyncio.create_subprocess_exec(
@@ -804,6 +869,7 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     state.active_proc = proc
     state.steps = []
     state.injected = []
+    state.main_done = False
     try:
         proc.stdin.write(user_msg(task_with_ctx))
         await proc.stdin.drain()
@@ -811,9 +877,15 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     except (BrokenPipeError, ConnectionResetError):
         pass   # CLI died on startup; pump() below collects its error output
     limit = channel_timeout(cfg)
-    results, junk = [], []
+    results, junk, unposted = [], [], []
+    bg = BgTracker()
     last_event = time.monotonic()
     err_task = asyncio.create_task(proc.stderr.read())  # drain so a full pipe can't stall the CLI
+
+    def close_stdin():
+        if state.active_stdin:
+            state.active_stdin = None
+            proc.stdin.close()
 
     async def pump():
         nonlocal last_event
@@ -824,21 +896,43 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
             except json.JSONDecodeError:
                 junk.append(line.decode(errors="replace"))
                 continue
+            bg.feed(ev)
             if ev.get("type") == "result":
-                # a message injected during the final answer can start a 2nd turn; keep every result
+                # one result per turn: main answer, injected messages, background-task notifications
                 results.append(ev)
-                if state.active_stdin:
-                    state.active_stdin = None
-                    proc.stdin.close()
+                state.main_done = True
+                if not bg.pending:
+                    close_stdin()   # nothing left to wait for -> CLI exits after this turn
+                text = ev.get("result") or ""
+                if text:
+                    text = ("[error] " if ev.get("is_error") else "") + text
+                    if post is None:
+                        unposted.append(text)
+                    else:
+                        try:
+                            await post(text)
+                        except Exception as e:   # Discord hiccup: keep it for the exit post
+                            print(f"[run_claude] posting a result failed: {e!r}", flush=True)
+                            unposted.append(text)
             else:
                 state.steps.extend(describe_event(ev))
         await proc.wait()
 
     async def idle_watch():
-        while time.monotonic() - last_event < IDLE_TIMEOUT:
+        # Pending background work counts as activity (hard cap still applies). With nothing pending,
+        # a stdin left open after a result is closed after 60s quiet so the CLI can exit.
+        while True:
             await asyncio.sleep(15)
+            quiet = time.monotonic() - last_event
+            if bg.pending:
+                continue
+            if results and quiet > 60:
+                close_stdin()
+            if quiet >= IDLE_TIMEOUT:
+                return
 
-    # A task that keeps producing events runs until the hard cap; a silent one dies after IDLE_TIMEOUT.
+    # A task that keeps producing events (or has background work pending) runs until the hard cap;
+    # a silent one dies after IDLE_TIMEOUT.
     pump_t, idle_t = asyncio.create_task(pump()), asyncio.create_task(idle_watch())
     try:
         await asyncio.wait({pump_t, idle_t}, timeout=limit, return_when=asyncio.FIRST_COMPLETED)
@@ -860,9 +954,13 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
     err = (await err_task).decode(errors="replace").strip()
 
     data = results[-1] if results else {}
-    out = "\n\n".join(r["result"] for r in results if r.get("result")) or "".join(junk).strip()
-    if data.get("is_error"):
-        out = f"[error] {out}"
+    texts = [("[error] " if r.get("is_error") else "") + r["result"] for r in results if r.get("result")]
+    out = "\n\n".join(texts)
+    if not texts:
+        out = "".join(junk).strip()
+        if data.get("is_error"):
+            out = f"[error] {out}"
+        unposted.append(out or "(no output)")
     new_sid = data.get("session_id")
     if new_sid:
         now = time.time()
@@ -874,11 +972,11 @@ async def run_claude(cfg: ChannelConfig, state: ChannelState, task: str, cwd: st
 
     if err:
         out += f"\n\n[stderr]\n{err}"
+        unposted.append(f"[stderr]\n{err}")
 
-    final_out = out or "(no output)"
     history_task = task + "".join(f"\n\n[added mid-task] {m}" for m in state.injected)
-    append_chat_history(state, history_task, final_out)
-    return final_out
+    append_chat_history(state, history_task, out or "(no output)")
+    return "\n\n".join(unposted)
 
 
 async def progress_ping(status_msg: discord.Message, state: ChannelState):
@@ -1431,21 +1529,33 @@ async def on_message(message: discord.Message):
             + f"`{fmt_secs(IDLE_TIMEOUT)}` idle")
         return
 
-    # ── reject concurrent tasks (per channel) ────────────────────────────────
+    quote = await quote_prefix(message) if not is_webhook else ""
+
+    # ── busy channel: inject, queue, or reject (per channel) ─────────────────
     if state.active_task and not state.active_task.done():
-        # Gaurav correcting a running task ("NAS, not NASA") → feed it into the same session.
-        # Webhook callers and attachments still get the old answer.
+        # Gaurav correcting a running task ("NAS, not NASA"), or talking to it while its background
+        # work is still pending → feed it into the same session. Attachments and webhooks can't be.
         if state.active_stdin and text and not is_webhook and not image_attachments and not file_attachments:
+            label = "[Gaurav]" if state.main_done else "[Gaurav, mid-task]"
             try:
-                state.active_stdin.write(user_msg(f"[Gaurav, mid-task] {text}"))
+                state.active_stdin.write(user_msg(f"{label} {quote}{text}"))
                 await state.active_stdin.drain()
-                state.injected.append(text)
+                state.injected.append(quote + text)
+                state.reply_to = message   # the turn this starts answers this message
                 await message.add_reaction("↪️")
                 return
-            except (ConnectionResetError, BrokenPipeError):
-                pass   # task finished between the check and the write
-        await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
-        return
+            except (ConnectionResetError, BrokenPipeError, AttributeError):
+                pass   # stdin closed between the check and the write -> queue below
+        elif is_webhook or state.active_stdin or state.queued:
+            await message.reply("Already running a task in this channel. Use `!cancel` to stop it first.")
+            return
+        # stdin is closed: the task is winding down. Run this message as the next task once it exits.
+        state.queued = True
+        try:
+            await message.add_reaction("⏳")
+            await asyncio.wait({state.active_task})
+        finally:
+            state.queued = False
 
     # ── download image attachments to temp files ─────────────────────────────
     image_paths = []
@@ -1470,6 +1580,7 @@ async def on_message(message: discord.Message):
 
     # ── dispatch task ────────────────────────────────────────────────────────
     cwd, task = resolve_dir(cfg, text)
+    task = quote + task
 
     if image_paths:
         img_note = "\n".join(
@@ -1501,30 +1612,41 @@ async def on_message(message: discord.Message):
     ack = "Ack — webhook request received. " if is_webhook else ""
     status = await message.reply(f"{ack}⏳ thinking…")
 
+    status_live = [True]
+
+    async def drop_status():
+        """The ⏳ status goes away at the first reply; typing… shows any later background work."""
+        ping.cancel()
+        if status_live[0]:
+            status_live[0] = False
+            try:
+                await status.delete()
+            except discord.HTTPException:
+                pass
+
+    async def post(output):
+        """Send one answer (a turn's result) as a reply to the message that started that turn."""
+        await drop_status()
+        to = state.reply_to or message
+        output, sends = extract_sends(output)
+        shown, lists = checklist.extract_blocks(output)
+        await send_long(message.channel, shown or "(attached below)", reply_to=to)
+        await send_files(message.channel, sends)
+        for title, items in lists:
+            await checklist.post(message.channel, checklist.new_adhoc(title, items))
+        await relay_to_slack(cfg, text if to is message else to.content.strip(), output, slack_source)
+
     async def do_task():
         state.steps = []  # don't flash the previous task's steps before run_claude resets them
-        ping = asyncio.create_task(progress_ping(status, state))
+        state.reply_to = message
         try:
             async with message.channel.typing():
-                output = await run_claude(cfg, state, task, cwd)
-            ping.cancel()
-            try:
-                await status.delete()
-            except discord.NotFound:
-                pass
-            output, sends = extract_sends(output)
-            shown, lists = checklist.extract_blocks(output)
-            await send_long(message.channel, shown or "(attached below)", reply_to=message)
-            await send_files(message.channel, sends)
-            for title, items in lists:
-                await checklist.post(message.channel, checklist.new_adhoc(title, items))
-            await relay_to_slack(cfg, text, output, slack_source)
+                output = await run_claude(cfg, state, task, cwd, post)
+            if output:      # whatever wasn't posted live (timeout, stderr, no output)
+                await post(output)
+            await drop_status()
         except asyncio.CancelledError:
-            ping.cancel()
-            try:
-                await status.delete()
-            except discord.NotFound:
-                pass
+            await drop_status()
             await message.reply("Task was cancelled.")
             await relay_to_slack(cfg, text, "(task was cancelled before it finished)",
                                  slack_source)
@@ -1540,6 +1662,7 @@ async def on_message(message: discord.Message):
                 except OSError:
                     pass
 
+    ping = asyncio.create_task(progress_ping(status, state))
     state.active_task = asyncio.create_task(do_task())
 
 
