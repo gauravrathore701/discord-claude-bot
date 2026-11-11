@@ -1361,6 +1361,13 @@ async def on_message(message: discord.Message):
     cfg = CHANNELS.get(message.channel.id)
     if cfg is None:
         return
+    # Failover standby stays silent; no role file = no leaderd here, behave as before.
+    try:
+        with open("/run/failover/role") as f:
+            if f.read().strip() != "leader":
+                return
+    except FileNotFoundError:
+        pass
     state = STATES[cfg.id]
 
     # Webhook posts only run a task when that webhook id is listed in the channel's
