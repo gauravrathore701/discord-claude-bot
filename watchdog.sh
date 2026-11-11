@@ -12,13 +12,20 @@ UNIT=discord-claude.service
 # forced the Pi off a working fallback AP on 2026-08-30 and drove a
 # reboot loop, because brcmfmac cannot associate to a second BSS while
 # still holding the first one.
-WIFI=$(nmcli -t -f TYPE,NAME con show --active \
+WIFI=$(nmcli -t -f TYPE,NAME con show --active 2>/dev/null \
         | awk -F: '$1=="802-11-wireless"{print $2; exit}')
 : "${WIFI:=Prestige_5G}"
 MAX_STALE=600     # 10m — 5 missed heartbeats
 GRACE=300         # 5m — let a fresh start reach on_ready before judging it
 
 now=$(date +%s)
+
+# Failover VM (WATCHDOG_HOST=vm in its unit): watch the bot only while leading (a restart on the
+# standby would start a second bot), and skip the WiFi/NM/reboot ladder below — it is Pi hardware.
+if [ "${WATCHDOG_HOST:-pi}" = vm ]; then
+    [ "$(cat /run/failover/role 2>/dev/null)" = leader ] || exit 0
+    SKIP_NET=1
+fi
 
 # Host DNS first: on Aug 10-12 2026 the bot restart-looped for two days because
 # NetworkManager blanked /etc/resolv.conf after a wifi drop. Restarting the bot
@@ -33,7 +40,7 @@ REBOOT_STAMP=/var/lib/discord-claude-watchdog/last_reboot
 REBOOT_COOLDOWN=3600
 BOOT_GRACE=900
 
-if ! getent hosts discord.com >/dev/null 2>&1; then
+if [ -z "${SKIP_NET:-}" ] && ! getent hosts discord.com >/dev/null 2>&1; then
     n=$(( $(cat "$STRIKES" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STRIKES"
     boot_s=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)

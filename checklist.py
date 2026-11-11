@@ -558,6 +558,15 @@ def _post_dt(day: date) -> datetime:
     return datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m)
 
 
+def _is_leader() -> bool:
+    """No /run/failover/role = no leaderd on this host = behave as before."""
+    try:
+        with open("/run/failover/role") as f:
+            return f.read().strip() == "leader"
+    except FileNotFoundError:
+        return True
+
+
 async def daily_loop():
     """Post today's task list at TASKS_POST_TIME. If the bot was down at that time,
     post as soon as it comes up (unless today's list was already posted)."""
@@ -567,6 +576,11 @@ async def daily_loop():
         if now >= _post_dt(today):
             key = daily_key(today)
             if key not in _load_track():
+                # Failover standby must not post; re-check each minute so whoever leads posts once.
+                # messages.json syncs via Syncthing, so the other host sees the post as done.
+                if not _is_leader():
+                    await asyncio.sleep(60)
+                    continue
                 try:
                     ensure_today(today)
                     ch = _client.get_channel(TASKS_CHANNEL_ID) or await _client.fetch_channel(TASKS_CHANNEL_ID)

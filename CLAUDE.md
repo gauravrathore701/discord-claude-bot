@@ -187,6 +187,7 @@ always a markdown file of `- [ ]` / `- [x]` lines; the Discord message is just a
   changed (Claude appended a task, a tick in Obsidian) and re-renders the message. Tracking
   (`key -> channel, message, mtime`) is in `.claude/checklists/messages.json` (gitignored);
   entries drop after 14 days or when the message is deleted. `!tasks` re-posts and moves tracking.
+- **Failover gate** (2026-11-12) — `daily_loop()` posts only when `_is_leader()` (`/run/failover/role` = `leader`, or no file); standby re-checks every 60s. `messages.json` syncs via Syncthing, so the list is posted once by whichever host leads.
 - Limits: 25 buttons (extra items listed as text), labels cut at 80 chars, markdown stripped.
 - How Claude should use all of this is the shared skill `~/.claude/skills/discord-checklist/SKILL.md`.
 
