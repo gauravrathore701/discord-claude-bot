@@ -19,10 +19,10 @@ CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 REMINDERS_FILE = "/home/gaurav/Projects/daily-script/reminder/reminders.txt"
 
-# !wakepc — magic packet to the Nitro 5 over the direct 192.168.50.0/24 link.
+# !wakepc — magic packet to the Nitro 5; reached over Tailscale since the cable went (2026-11-12).
 WOL_SCRIPT = "/home/gaurav/Projects/daily-script/bash/wol_pc.sh"
 WOL_TIMEOUT = 120  # the script itself gives up at 90s
-PC_IP = "192.168.50.2"
+PC_IP = "100.68.111.11"
 
 # !reboot is two-step. This holds the deadline for the confirm step.
 _reboot_armed_until: float = 0.0
